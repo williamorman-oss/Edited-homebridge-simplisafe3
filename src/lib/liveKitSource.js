@@ -8,7 +8,7 @@ import {
     SignalTarget
 } from '@livekit/protocol';
 
-const trackTimeout = 30000; // ms, how long to wait for the camera's video track
+const trackTimeout = 30000; // ms, how long a live view waits for the camera's video
 
 // LiveKit subscriber. werift gives the encoded RTP so H.264 can be passed to HomeKit untouched
 class LiveKitSource {
@@ -37,10 +37,38 @@ class LiveKitSource {
         if (notify) notify(reason);
     }
 
-    // Resolves once the first video RTP packet arrives i.e. media is flowing
-    async connect() {
+    // Resolves once the first video RTP packet arrives i.e. media is flowing.
+    // The timeout covers the whole join, including waking a sleeping battery camera
+    async connect(timeoutMs = trackTimeout) {
+        let timeoutID;
+        const timedOut = new Promise((resolve, reject) => {
+            timeoutID = setTimeout(() => reject(new Error(this._timeoutMessage(timeoutMs))), timeoutMs);
+        });
+
+        try {
+            await Promise.race([this._connect(), timedOut]);
+        } finally {
+            clearTimeout(timeoutID);
+        }
+    }
+
+    _timeoutMessage(timeoutMs) {
+        const details = this.ss3Camera.cameraDetails || {};
+        const features = details.supportedFeatures || {};
+        let hint = '';
+        if (features.battery || features.wired === false) {
+            const battery = details.cameraStatus && details.cameraStatus.batteryPercentage;
+            const level = typeof battery === 'number' ? ` (${battery}% at last check)` : '';
+            hint = ` It runs on battery${level} and may be asleep or out of charge, check its battery and Wi-Fi in the SimpliSafe app.`;
+        }
+        return `Timed out after ${timeoutMs / 1000}s waiting for video from ${this.ss3Camera.name}.${hint}`;
+    }
+
+    async _connect() {
         const liveView = await this.simplisafe.getCameraLiveView(this.ss3Camera.id);
         if (this.debug) this.log(`LiveKit: ${this.ss3Camera.name} cameraStatus ${liveView.cameraStatus}`);
+        // closed while the live view was being requested, e.g. timed out
+        if (this.closed) throw new Error('LiveKit session closed before joining');
 
         const url = `${liveView.liveKitURL}/rtc?access_token=${liveView.userToken}&auto_subscribe=1&protocol=15&sdk=js&version=2.22.3`;
         this.ws = new WebSocket(url);
@@ -51,20 +79,9 @@ class LiveKitSource {
 
         return new Promise((resolve, reject) => {
             let settled = false;
-            const timeoutID = setTimeout(() => {
-                if (!settled) {
-                    settled = true;
-                    // Battery cameras sleep and may need a wake request first, which is not implemented
-                    const features = this.ss3Camera.cameraDetails && this.ss3Camera.cameraDetails.supportedFeatures;
-                    const hint = features && features.wired === false ? ' This camera is battery powered, which is not supported yet.' : '';
-                    reject(new Error(`Timed out after ${trackTimeout}ms waiting for video from ${this.ss3Camera.name}.${hint}`));
-                }
-            }, trackTimeout);
-
             const settle = (err) => {
                 if (settled) return;
                 settled = true;
-                clearTimeout(timeoutID);
                 if (err) reject(err); else resolve();
             };
 
@@ -165,7 +182,11 @@ class LiveKitSource {
             send({ message: { case: 'trickle', value: new TrickleRequest({ candidateInit: JSON.stringify(candidate), target: SignalTarget.SUBSCRIBER }) } });
         });
 
+        // werift announces known tracks again on every renegotiation, listening twice would forward every packet twice
+        const knownTracks = new WeakSet();
         this.pc.onTrack.subscribe(track => {
+            if (knownTracks.has(track)) return;
+            knownTracks.add(track);
             if (this.debug) this.log(`LiveKit: subscribed to ${track.kind} (${track.codec && track.codec.mimeType})`);
 
             track.onReceiveRtp.subscribe(rtp => {
@@ -200,7 +221,6 @@ class LiveKitSource {
         this.streaming = false;
         this.onVideoRtp = null;
         this.onAudioRtp = null;
-        this.onSessionEnded = null;
         this.onSessionEnded = null;
 
         try {

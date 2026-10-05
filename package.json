@@ -23,7 +23,6 @@
     "axios-retry": "^3.2.4",
     "ffmpeg-for-homebridge": "^2.2.0",
     "is-docker": "^2.2.1",
-    "jpeg-extract": "^3.0.1",
     "werift": "^0.24.4",
     "ws": "^8.5.0"
   },

@@ -76,6 +76,11 @@ In 2021, SimpliSafe transitioned to only supporting a protocol called OAuth for 
 #### `cameras` and `cameraOptions`
 These enable camera support. See [Camera Support](#camera-support) for more details.
 
+#### `camerasOnly`
+Type: boolean (default `false`)
+
+Only add cameras, not the alarm, sensors or locks. HomeKit sends each bridge's requests one at a time, so running the cameras on their own [child bridge](https://github.com/homebridge/homebridge/wiki/Child-Bridges) means a slow camera can never hold up the alarm. See [Running the cameras separately](#running-the-cameras-separately).
+
 #### `debug`
 Type: boolean (default `false`)
 
@@ -109,7 +114,7 @@ Alarm                  | :white_check_mark: | Arming/disarming to home, away and
 SimpliCam              | :white_check_mark: | Audio, video, motion*, no microphone
 Video Doorbell Pro     | :white_check_mark: | Audio, video, motion, no microphone
 Video Doorbell Series 2| :white_check_mark: | Audio, video, motion, no microphone
-Outdoor Camera         | :white_check_mark: | Audio, video, motion, no microphone
+Outdoor Camera         | :white_check_mark: | Audio, video, motion, battery level, no microphone. See [Battery cameras](#battery-cameras)
 Wireless Indoor Camera | :grey_question:    | Untested, may work, please [report your findings](https://github.com/homebridge-simplisafe3/homebridge-simplisafe3/discussions/new?category=general)
 Smart lock             | :white_check_mark: | Fully supports locking, unlocking
 Entry sensor           | :white_check_mark: | Status not provided as 'push' by SS so is polled based on `sensorRefresh`
@@ -137,6 +142,15 @@ Cameras stream one of two ways depending on the model. The SimpliCam and Video D
 
 Only the SimpliCam, Video Doorbell Pro and Video Doorbell Series 2 have been tested against real hardware. Other newer cameras may work if SimpliSafe streams them the same way, and [#240](https://github.com/homebridge-simplisafe3/homebridge-simplisafe3/discussions/240) is the place to report whether they do.
 
+#### Snapshots
+HomeKit sends a bridge's requests one at a time: camera snapshots, starting a live view, and alarm and lock commands all wait for the request before them. Fetching a new snapshot takes a few seconds (longer if a battery camera has to wake up), so the plugin answers snapshot requests straight away with the most recent image and refreshes it in the background. Tiles in the Home app may therefore show an image that is a few seconds old (a few minutes for battery cameras). Doorbell and motion notifications always wait briefly for a new image. The last image of each camera is kept on disk so tiles show something straight after a restart.
+
+#### Battery cameras
+Battery cameras such as the Outdoor Camera sleep between events, and every snapshot or live view wakes them, which takes 5-10 seconds and uses battery. While a battery camera is not charging its snapshot is only refreshed when it is more than `batterySnapshotMinutes` (default `10`) old, or for a motion notification. Cameras that are plugged in or charging from a solar panel refresh every minute. If a camera does not respond (e.g. its battery is empty) the plugin shows a placeholder image and waits longer and longer between attempts. Battery cameras also report their battery level and charging state to HomeKit.
+
+#### Running the cameras separately
+To keep cameras from ever slowing down the alarm, add a second instance of the platform with `"camerasOnly": true` and run it as a child bridge, and turn `cameras` off in the instance that has the alarm.
+
 #### Camera Options
 This plugin includes [ffmpeg-for-homebridge](https://github.com/homebridge/ffmpeg-for-homebridge) to automatically include a compatible build of ffmpeg and thus the plugin works "out of the box" without requiring a custom ffmpeg build.
 
@@ -147,7 +161,8 @@ For advanced scenarios including specifying a custom ffmpeg build or command lin
     "ffmpegPath": "/path/to/custom/ffmpeg",
     "sourceOptions": "-format: flv ... (any other ffmpeg argument)",
     "videoOptions": "-vcodec h264_omx -tune false ... (any other ffmpeg argument)",
-    "audioOptions": "-ar 256k ... (any other ffmpeg argument)"
+    "audioOptions": "-ar 256k ... (any other ffmpeg argument)",
+    "batterySnapshotMinutes": 10
 }
 ```
 

@@ -137,3 +137,61 @@ test('getWebRTCProvider surfaces the raw value so unsupported cameras can be rep
     assert.equal(SS3Camera.prototype.getWebRTCProvider.call(withProvider('kvs')), 'kvs');
     assert.equal(SS3Camera.prototype.getWebRTCProvider.call({ cameraDetails: {} }), undefined);
 });
+
+test('battery cameras are recognised from their features, charging from their state', () => {
+    const camera = (details) => ({ cameraDetails: details });
+    const outdoor = { supportedFeatures: { wired: false, battery: true }, currentState: { batteryCharging: true }, cameraStatus: { batteryPercentage: 89.6 } };
+    const doorbell = { supportedFeatures: { wired: true, battery: false }, cameraStatus: { batteryPercentage: 100 } };
+
+    assert.equal(SS3Camera.prototype.isBatteryPowered.call(camera(outdoor)), true);
+    assert.equal(SS3Camera.prototype.isBatteryPowered.call(camera(doorbell)), false);
+    assert.equal(SS3Camera.prototype.isBatteryPowered.call(camera({})), false);
+    assert.equal(SS3Camera.prototype.isCharging.call(camera(outdoor)), true);
+    assert.equal(SS3Camera.prototype.isCharging.call(camera(doorbell)), false);
+    assert.equal(SS3Camera.prototype.batteryLevel.call(camera(outdoor)), 90);
+    assert.equal(SS3Camera.prototype.batteryLevel.call(camera({})), null);
+});
+
+test('_validateEvent also matches the camera by its short serial', () => {
+    const ctx = {
+        accessory: {},
+        id: 'b26f49e83ed74bbcbbca4d34f13787bb',
+        cameraDetails: { serial: 'f13787bb' },
+        debug: false,
+        log: () => {},
+    };
+
+    assert.equal(SS3Camera.prototype._validateEvent.call(ctx, 'CAMERA_MOTION', { sensorSerial: 'f13787bb' }), true);
+    assert.equal(SS3Camera.prototype._validateEvent.call(ctx, 'MOTION', { sensorSerial: 'f13787bb' }), true);
+    assert.equal(SS3Camera.prototype._validateEvent.call(ctx, 'MOTION', { sensorSerial: '01ab98fa' }), false);
+});
+
+test('a motion sensor event that names a linked camera does not trigger that camera', () => {
+    const ctx = { accessory: {}, id: 'camera-1', cameraDetails: {}, debug: false, log: () => {} };
+
+    assert.equal(SS3Camera.prototype._validateEvent.call(ctx, 'MOTION', { sensorSerial: 'motion-sensor', internal: { mainCamera: 'camera-1' } }), false);
+    assert.equal(SS3Camera.prototype._validateEvent.call(ctx, 'CAMERA_MOTION', { sensorSerial: 'base', internal: { mainCamera: 'camera-1' } }), true);
+});
+
+test('the battery service reports level, low battery and charging', () => {
+    const updates = {};
+    const service = { updateCharacteristic: (name, value) => { updates[name] = value; } };
+    const Characteristic = {
+        BatteryLevel: 'BatteryLevel',
+        StatusLowBattery: Object.assign('StatusLowBattery', { BATTERY_LEVEL_LOW: 1, BATTERY_LEVEL_NORMAL: 0 }),
+        ChargingState: Object.assign('ChargingState', { CHARGING: 1, NOT_CHARGING: 0 }),
+    };
+    const ctx = (details) => Object.assign(Object.create(SS3Camera.prototype), {
+        cameraDetails: details,
+        accessory: { getService: () => service },
+        api: { hap: { Service: { Battery: 'Battery' }, Characteristic } },
+    });
+
+    ctx({ supportedFeatures: { battery: true }, cameraStatus: { batteryPercentage: 15 }, currentState: { batteryCharging: false } }).updateBatteryService();
+    assert.deepEqual(updates, { BatteryLevel: 15, StatusLowBattery: 1, ChargingState: 0 });
+
+    const camera = ctx({ supportedFeatures: { battery: true }, cameraStatus: { batteryPercentage: 15 }, currentState: {} });
+    camera.updateCameraDetails({ supportedFeatures: { battery: true }, cameraStatus: { batteryPercentage: 100 }, currentState: { batteryCharging: true } });
+    assert.deepEqual(updates, { BatteryLevel: 100, StatusLowBattery: 0, ChargingState: 1 });
+    assert.equal(camera.cameraDetails.cameraStatus.batteryPercentage, 100);
+});

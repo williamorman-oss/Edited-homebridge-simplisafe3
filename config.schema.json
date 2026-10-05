@@ -20,6 +20,12 @@
         "default": false,
         "description": "Enable camera support."
       },
+      "camerasOnly": {
+        "title": " Cameras Only",
+        "type": "boolean",
+        "default": false,
+        "description": "Only add cameras, not the alarm, sensors or locks. Use this to run the cameras on their own child bridge, so camera snapshots never hold up the alarm."
+      },
       "debug": {
         "title": " Debug",
         "type": "boolean"
@@ -41,6 +47,13 @@
       "cameraOptions": {
         "type": "object",
         "properties": {
+          "batterySnapshotMinutes": {
+            "title": "Battery Camera Snapshot Interval (minutes)",
+            "description": "How old a battery camera's snapshot can get before viewing it in the Home app wakes the camera for a new one. Lower values use more battery. Plugged-in cameras refresh every minute.",
+            "type": "integer",
+            "default": 10,
+            "minimum": 1
+          },
           "enableHwaccelRpi": {
             "title": " Enable Hardware Acceleration for Raspberry Pi",
             "description": "This may not work if you set the path to use a custom build of ffmpeg",
@@ -52,7 +65,7 @@
             "type": "string",
             "placeholder": "/path/to/custom/ffmpeg",
             "condition": {
-              "functionBody": "return (model.cameras)"
+              "functionBody": "return (model.cameras || model.camerasOnly)"
             }
           },
           "sourceOptions": {
@@ -60,7 +73,7 @@
             "type": "string",
             "placeholder": "e.g. -vcodec h264_mmal",
             "condition": {
-              "functionBody": "return (model.cameras)"
+              "functionBody": "return (model.cameras || model.camerasOnly)"
             }
           },
           "videoOptions": {
@@ -68,7 +81,7 @@
             "type": "string",
             "placeholder": "e.g. -vcodec h264_omx -tune false",
             "condition": {
-              "functionBody": "return (model.cameras)"
+              "functionBody": "return (model.cameras || model.camerasOnly)"
             }
           },
           "audioOptions": {
@@ -76,7 +89,7 @@
             "type": "string",
             "placeholder": "e.g. -ar 256k",
             "condition": {
-              "functionBody": "return (model.cameras)"
+              "functionBody": "return (model.cameras || model.camerasOnly)"
             }
           }
         }
@@ -94,7 +107,8 @@
       "type": "fieldset",
       "items": [
         "name",
-        "cameras"
+        "cameras",
+        "camerasOnly"
       ]
     },
     {
@@ -102,9 +116,10 @@
       "expandable": true,
       "title": "Advanced Camera Settings",
 			"condition": {
-				"functionBody": "return (model.cameras)"
+				"functionBody": "return (model.cameras || model.camerasOnly)"
 			},
       "items": [
+        "cameraOptions.batterySnapshotMinutes",
         "cameraOptions.enableHwaccelRpi",
         "cameraOptions.ffmpegPath",
         "cameraOptions.sourceOptions",

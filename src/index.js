@@ -1,4 +1,5 @@
-import SimpliSafe3, { SENSOR_TYPES, RateLimitError } from './simplisafe';
+import path from 'path';
+import SimpliSafe3, { SENSOR_TYPES, SYSTEM_UPDATED, RateLimitError } from './simplisafe';
 import SimpliSafe3AuthenticationManager from './lib/authManager';
 import Alarm from './accessories/alarm';
 import EntrySensor from './accessories/entrySensor';
@@ -14,6 +15,8 @@ import UnreachableAccessory from './accessories/unreachableAccessory';
 const PLUGIN_NAME = 'homebridge-simplisafe3';
 const PLATFORM_NAME = 'SimpliSafe 3';
 
+const cameraRefreshInterval = 10 * 60 * 1000; // ms, keeps camera battery and charging state current
+
 let UUIDGen;
 
 class SS3Platform {
@@ -21,7 +24,9 @@ class SS3Platform {
     constructor(log, config, api) {
         this.log = log;
         this.name = config.name;
-        this.enableCameras = config.cameras || false;
+        // only cameras, e.g. to run them on their own bridge next to another instance with the alarm and sensors
+        this.camerasOnly = config.camerasOnly || false;
+        this.enableCameras = config.cameras || this.camerasOnly;
         this.cameraOptions = config.cameraOptions || null;
         this.debug = config.debug || false;
         this.persistAccessories = config.persistAccessories !== undefined ? config.persistAccessories : true;
@@ -38,6 +43,7 @@ class SS3Platform {
             refreshInterval = config.sensorRefresh * 1000;
         }
 
+        this.snapshotDir = path.join(this.api.user.storagePath(), `${PLUGIN_NAME}-snapshots`);
         this.authManager = new SimpliSafe3AuthenticationManager(this.api.user.storagePath(), log, this.debug);
         this.simplisafe = new SimpliSafe3(refreshInterval, this.authManager, this.api.user.storagePath(), log, this.debug);
 
@@ -80,6 +86,7 @@ class SS3Platform {
                     else {
                         this.simplisafe.startListening();
                         this.createNewPlatformAccessories();
+                        this.startCameraRefresh();
                     }
                 })
                 .catch(err => {
@@ -165,6 +172,35 @@ class SS3Platform {
         }
     }
 
+    // Camera details, e.g. battery level, are only fetched with the alarm system, so pass on every update
+    // and ask for one now and then in case nothing else does
+    startCameraRefresh() {
+        if (!this.enableCameras || this.cameraRefreshIntervalID) return;
+
+        this.simplisafe.on(SYSTEM_UPDATED, system => {
+            try {
+                this.updateCameraDetails(system.cameras);
+            } catch (err) {
+                this.log.error('An error occurred while updating camera details:', err);
+            }
+        });
+
+        this.cameraRefreshIntervalID = setInterval(() => {
+            this.simplisafe.getCameras().catch(err => {
+                if (this.debug && !(err instanceof RateLimitError)) this.log.error('Camera details refresh failed:', err.message || err);
+            });
+        }, cameraRefreshInterval);
+    }
+
+    updateCameraDetails(cameras) {
+        if (!Array.isArray(cameras)) return;
+        for (let device of this.devices) {
+            if (!(device instanceof Camera)) continue;
+            let details = cameras.find(camera => camera.uuid === device.id);
+            if (details) device.updateCameraDetails(details);
+        }
+    }
+
     async discoverSimpliSafeDevices() {
         if (this.debug) this.log('Discovering devices from SimpliSafe');
         try {
@@ -173,7 +209,7 @@ class SS3Platform {
             let uuid = UUIDGen.generate(subscription.location.system.serial);
             let alarm = this.accessories.find(acc => acc.UUID === uuid);
 
-            if (!alarm) {
+            if (!alarm && !this.camerasOnly) {
                 const alarmAccessory = new Alarm(
                     'SimpliSafe 3',
                     subscription.location.system.serial,
@@ -186,7 +222,7 @@ class SS3Platform {
                 this.devices.push(alarmAccessory);
             }
 
-            let sensors = await this.simplisafe.getSensors();
+            let sensors = this.camerasOnly ? [] : await this.simplisafe.getSensors();
             for (let sensor of sensors) {
                 if (sensor.type == SENSOR_TYPES.KEYPAD ||
                     sensor.type == SENSOR_TYPES.KEYCHAIN ||
@@ -195,9 +231,11 @@ class SS3Platform {
                     sensor.type == SENSOR_TYPES.SIREN ||
                     sensor.type == SENSOR_TYPES.SIREN_2 ||
                     sensor.type == SENSOR_TYPES.DOORLOCK ||
-                    sensor.type == SENSOR_TYPES.DOORLOCK_2) {
+                    sensor.type == SENSOR_TYPES.DOORLOCK_2 ||
+                    sensor.type == SENSOR_TYPES.OUTDOOR_CAMERA ||
+                    sensor.type == SENSOR_TYPES.OUTDOOR_CAMERA_2) {
                     // Ignore as no data is provided by SimpliSafe
-                    // Door locks are configured below
+                    // Door locks are configured below, cameras with the other cameras
                     continue;
                 }
 
@@ -308,7 +346,7 @@ class SS3Platform {
                 }
             }
 
-            let locks = await this.simplisafe.getLocks();
+            let locks = this.camerasOnly ? [] : await this.simplisafe.getLocks();
             for (let lock of locks) {
                 let lockName = lock.name || `Smart Lock ${lock.serial}`;
                 let uuid = UUIDGen.generate(lock.serial);
@@ -360,7 +398,8 @@ class SS3Platform {
                             this.debug,
                             this.simplisafe,
                             this.authManager,
-                            this.api
+                            this.api,
+                            { snapshotDir: this.snapshotDir }
                         );
                         if (cameraAccessory.isUnsupported()) this.log.warn(`Detected unsupported camera ${cameraName}, some features will be disabled.`);
 

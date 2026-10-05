@@ -1,6 +1,16 @@
 # Change Log
 All notable changes are documented here.
 
+## Unreleased
+- Snapshots are answered straight away from the latest image and refreshed in the background. HomeKit sends a bridge's requests one at a time, so a slow or offline camera used to hold up every other camera, live view and the alarm
+- Faster live view for the SimpliCam and Video Doorbell Pro: video starts about 2 seconds sooner and no longer runs about 2 seconds behind
+- Outdoor Camera: battery level and charging state in HomeKit, less frequent snapshots while on battery (`batterySnapshotMinutes`), placeholder and back-off for cameras that do not respond, no more "Sensor not (yet) supported" warnings
+- New `camerasOnly` option to run cameras on their own bridge
+- Fix: `"-tune false"` style options now remove the argument as documented, and new `videoOptions` / `audioOptions` arguments are no longer ignored
+- Fix: a failed SimpliSafe request during a SimpliCam snapshot could leave HomeKit waiting and crash the bridge
+- Fix: LiveKit audio packets could be sent to HomeKit twice
+- The access token is no longer written to the debug log
+
 ## v1.11.2 (2026-09-27)
 - Use direct Opus encoding for Video Doorbell Series 2 audio
 

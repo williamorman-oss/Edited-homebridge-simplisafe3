@@ -1,5 +1,4 @@
 import { spawn } from 'child_process';
-import jpegExtract from 'jpeg-extract';
 import crypto from 'crypto';
 import dns from 'dns';
 import { promisify } from 'util';
@@ -12,19 +11,35 @@ import { SrtpSession, ProtectionProfileAes128CmHmacSha1_80 } from 'werift';
 
 import LiveKitSource from './liveKitSource';
 import KeyframeCollector from './h264';
+import SnapshotCache from './snapshotCache';
+import { fetchMjpegFrame } from './mjpeg';
+import { applyFfmpegOptions, flattenFfmpegArgs, redactFfmpegArgs } from './ffmpegArgs';
 
 const dnsLookup = promisify(dns.lookup);
 
 const videoPayloadType = 99;
 const audioPayloadType = 110;
-const snapshotCacheTime = 60000; // ms
 const prepareTimeout = 20000; // ms, give up on a prepared session HomeKit never started
-const keyframeTimeout = 15000; // ms, waiting for a keyframe to build a snapshot from
+const keyframeTimeout = 15000; // ms, waiting for a keyframe to build a snapshot from once LiveKit is connected
+
+// Snapshots are served from a cache and refreshed in the background, see SnapshotCache
+const snapshotBudget = 5000; // ms to wait when there is no image yet, inside HomeKit's 8s 'slow' warning
+const freshSnapshotBudget = 7000; // ms to wait for a new image for a doorbell or motion notification
+const legacySnapshotRefreshAge = 10000; // ms, the Home app asks every 8-10s per visible camera
+const poweredSnapshotRefreshAge = 60000; // ms, each LiveKit refresh joins the camera's room
+const defaultBatterySnapshotMinutes = 10; // each refresh wakes a battery camera
+const streamSnapshotInterval = 10000; // ms between snapshots taken from a running live view
+const recentEventWindow = 15000; // ms after motion or a doorbell press that snapshots should be new
+const legacySnapshotTimeout = 10000; // ms
+const liveKitSnapshotTimeout = 20000; // ms to join and wake a camera, battery cameras took 5-6s from sleep
+const alarmStateTimeout = 3000; // ms to wait for the alarm state when it is not known yet
 
 const privacyShutterImage = path.resolve(__dirname, '..', 'images', 'privacyshutter_snapshot.png');
 const privacyShutterImageInBytes = fs.readFileSync(privacyShutterImage);
 const unsupportedCameraImage = path.resolve(__dirname, '..', 'images', 'unsupportedcamera_snapshot.png');
 const unsupportedCameraImageInBytes = fs.readFileSync(unsupportedCameraImage);
+const snapshotWaitingImage = fs.readFileSync(path.resolve(__dirname, '..', 'images', 'snapshot_waiting.jpg'));
+const snapshotUnavailableImage = fs.readFileSync(path.resolve(__dirname, '..', 'images', 'snapshot_unavailable.jpg'));
 
 class StreamingDelegate {
     constructor(ss3Camera) {
@@ -33,15 +48,25 @@ class StreamingDelegate {
         this.log = ss3Camera.log;
         this.api = ss3Camera.api;
         this.cameraOptions = ss3Camera.cameraOptions;
-        this.cameraDetails = ss3Camera.cameraDetails;
 
         this.pendingSessions = {};
         this.ongoingSessions = {};
         this.liveKitSessions = {};
-        this.cachedSnapshot = null;
-        this.cachedSnapshotExpires = 0;
         this.snapshotBusy = false;
-        this.snapshotWarming = null;
+        this.snapshotWidth = 1280;
+
+        const liveKit = this.ss3Camera.getStreamProvider() === 'livekit';
+        this.snapshots = new SnapshotCache({
+            name: ss3Camera.name,
+            fetch: () => liveKit ? this.warmSnapshot() : this.fetchLegacySnapshot(),
+            refreshAge: () => this.snapshotRefreshAge(),
+            budget: snapshotBudget,
+            timeout: (liveKit ? liveKitSnapshotTimeout + keyframeTimeout : legacySnapshotTimeout) + 5000,
+            canRefresh: () => this.canRefreshSnapshot(),
+            persistPath: ss3Camera.snapshotPath,
+            log: this.log,
+            debug: ss3Camera.debug
+        });
 
         let fps = this.cameraDetails.cameraSettings.admin.fps;
         let streamingOptions = {
@@ -102,76 +127,109 @@ class StreamingDelegate {
         this.controller = cameraController;
     }
 
+    // Read through the camera so periodic refreshes (battery, charging) are seen here too
+    get cameraDetails() {
+        return this.ss3Camera.cameraDetails;
+    }
+
     async handleSnapshotRequest(request, callback) {
-        if (this.simplisafe.isBlocked && Date.now() < this.simplisafe.nextAttempt) {
-            callback(new Error('Camera snapshot request blocked (rate limited)'));
-            return;
-        }
+        try {
+            if (this.ss3Camera.debug) this.log(`Handling camera snapshot for '${this.ss3Camera.name}' at ${request.width}x${request.height}`);
 
-        let resolution = `${request.width}x${request.height}`;
-        if (this.ss3Camera.debug) this.log(`Handling camera snapshot for '${this.cameraDetails.cameraSettings.cameraName}' at ${resolution}`);
-
-        if (this.ss3Camera.getStreamProvider() === 'livekit') {
-            this.handleLiveKitSnapshotRequest(callback);
-            return;
-        }
-
-        if (this.ss3Camera.isUnsupported()) {
-            this.handleUnsupportedCameraSnapshotRequest(callback);
-            return;
-        }
-
-        if (!this.ss3Camera.motionIsTriggered && this.ss3Camera.supportsPrivacyShutter()) {
-            // Because if privacy shutter is closed we dont want snapshots triggering it to open
-            let alarmSystem = await this.simplisafe.getAlarmSystem();
-            switch (alarmSystem.alarmState) {
-            case 'OFF':
-                if (this.cameraDetails.cameraSettings.shutterOff !== 'open') {
-                    this.handlePrivacyShutterClosedSnapshotRequest(callback);
-                    return;
-                }
-                break;
-
-            case 'HOME':
-                if (this.cameraDetails.cameraSettings.shutterHome !== 'open') {
-                    this.handlePrivacyShutterClosedSnapshotRequest(callback);
-                    return;
-                }
-                break;
-
-            case 'AWAY':
-                if (this.cameraDetails.cameraSettings.shutterAway !== 'open') {
-                    this.handlePrivacyShutterClosedSnapshotRequest(callback);
-                    return;
-                }
-                break;
+            if (this.ss3Camera.isUnsupported()) {
+                this.handleUnsupportedCameraSnapshotRequest(callback);
+                return;
             }
+
+            if (await this.isPrivacyShutterClosed()) {
+                this.handlePrivacyShutterClosedSnapshotRequest(callback);
+                return;
+            }
+
+            if (request.width > this.snapshotWidth) this.snapshotWidth = request.width;
+
+            // HomeKit sends a bridge's requests one at a time, so answer from the cache rather than
+            // keep every other camera, live view and the alarm waiting on this camera
+            const fresh = this.wantsFreshSnapshot(request);
+            const image = await this.snapshots.get(fresh, fresh ? freshSnapshotBudget : snapshotBudget);
+            if (image) {
+                if (this.ss3Camera.debug) this.log(`Closed '${this.ss3Camera.name}' snapshot request with ${Math.round(image.length / 1000)}kB image from ${Math.round(this.snapshots.age() / 1000)}s ago`);
+                callback(undefined, image);
+            } else {
+                if (this.ss3Camera.debug) this.log(`No snapshot available yet for '${this.ss3Camera.name}', sending a placeholder`);
+                callback(undefined, this.snapshots.failing ? snapshotUnavailableImage : snapshotWaitingImage);
+            }
+        } catch (err) {
+            this.log.error(`An error occurred while handling a snapshot request for '${this.ss3Camera.name}':`, err && err.message ? err.message : err);
+            callback(err instanceof Error ? err : new Error(String(err)));
+        }
+    }
+
+    // SimpliCams close their privacy shutter depending on the alarm state, don't let a snapshot open it
+    async isPrivacyShutterClosed() {
+        if (this.ss3Camera.motionIsTriggered || !this.ss3Camera.supportsPrivacyShutter()) return false;
+
+        const settings = this.cameraDetails.cameraSettings;
+        const alarmState = await this.simplisafe.getRecentAlarmState(alarmStateTimeout);
+        switch (alarmState) {
+        case 'OFF':
+            return settings.shutterOff !== 'open';
+        case 'HOME':
+            return settings.shutterHome !== 'open';
+        case 'AWAY':
+            return settings.shutterAway !== 'open';
+        case null:
+        case undefined:
+            return true; // unknown, err on the side of privacy
+        default:
+            return false;
+        }
+    }
+
+    wantsFreshSnapshot(request) {
+        const reasons = this.api.hap.ResourceRequestReason;
+        const eventReason = reasons ? reasons.EVENT : 1;
+        const lastEventAt = this.ss3Camera.lastEventAt || 0;
+        return request.reason === eventReason || Date.now() - lastEventAt < recentEventWindow;
+    }
+
+    snapshotRefreshAge() {
+        if (this.ss3Camera.getStreamProvider() !== 'livekit') return legacySnapshotRefreshAge;
+
+        if (this.ss3Camera.isBatteryPowered() && !this.ss3Camera.isCharging()) {
+            const minutes = Number(this.cameraOptions && this.cameraOptions.batterySnapshotMinutes) || defaultBatterySnapshotMinutes;
+            return Math.max(1, minutes) * 60000;
         }
 
+        return poweredSnapshotRefreshAge;
+    }
+
+    canRefreshSnapshot() {
+        if (this.simplisafe.isBlocked && Date.now() < this.simplisafe.nextAttempt) return false;
+        // a running live view keeps the snapshot current, see cacheSnapshotFromStream
+        if (this.ss3Camera.getStreamProvider() === 'livekit' && Object.keys(this.liveKitSessions).length) return false;
+        return true;
+    }
+
+    async resolveMediaServer() {
         try {
             let newIpAddress = await dnsLookup('media.simplisafe.com');
             this.serverIpAddress = newIpAddress.address;
         } catch (err) {
-            if (!this.serverIpAddress) {
-                this.log.error('Could not resolve hostname for media.simplisafe.com');
-            }
+            if (!this.serverIpAddress) throw new Error('Could not resolve hostname for media.simplisafe.com');
         }
+        return this.serverIpAddress;
+    }
 
-        const url = {
-            url: `https://${this.serverIpAddress}/v1/${this.ss3Camera.cameraDetails.uuid}/mjpg?x=${request.width}&fr=1`,
+    async fetchLegacySnapshot() {
+        await this.resolveMediaServer();
+        return fetchMjpegFrame({
+            host: this.serverIpAddress, // TLS is not verified as we connect by the IP we just looked up
+            path: `/v1/${this.cameraDetails.uuid}/mjpg?x=${this.snapshotWidth}&fr=1`,
             headers: {
                 'Authorization': `Bearer ${this.ss3Camera.authManager.accessToken}`
             },
-            rejectUnauthorized: false // OK because we are using IP and just polled DNS
-        };
-
-        jpegExtract(url).then(img => {
-            if (this.ss3Camera.debug) this.log(`Closed '${this.cameraDetails.cameraSettings.cameraName}' snapshot request with ${Math.round(img.length/1000)}kB image`);
-            callback(undefined, img);
-        }).catch(err => {
-            this.log.error('An error occurred while making snapshot request:', err.statusCode ? err.statusCode : '', err.statusMessage ? err.statusMessage : '');
-            if (this.ss3Camera.debug) this.log.error(err);
-            callback(err);
+            timeout: legacySnapshotTimeout
         });
     }
 
@@ -301,162 +359,17 @@ class StreamingDelegate {
 
                 let sessionInfo = this.pendingSessions[sessionIdentifier];
                 if (sessionInfo) {
-                    let width = request.video.width ?? 1920;
-                    let fps = this.cameraDetails.cameraSettings.admin.fps;
-                    let videoBitrate = this.cameraDetails.cameraSettings.admin.bitRate;
-                    let audioBitrate = request.audio.max_bit_rate ?? 96;
-                    let audioSamplerate = request.audio.sample_rate ?? 16;
-                    let mtu = request.video.mtu ?? 1316;
-
-                    if (request.video.fps < fps) {
-                        fps = request.video.fps;
-                    }
-                    if (request.video.max_bit_rate < videoBitrate) {
-                        videoBitrate = request.video.max_bit_rate;
-                    }
-
                     try {
-                        let newIpAddress = await dnsLookup('media.simplisafe.com');
-                        this.serverIpAddress = newIpAddress.address;
+                        await this.resolveMediaServer();
                     } catch (err) {
-                        if (!this.serverIpAddress) {
-                            delete this.pendingSessions[sessionIdentifier];
-                            this.log.error('Camera stream request failed, could not resolve hostname for media.simplisafe.com', err);
-                            callback(err);
-                            return;
-                        }
+                        delete this.pendingSessions[sessionIdentifier];
+                        this.log.error('Camera stream request failed:', err.message);
+                        callback(err);
+                        return;
                     }
-
-                    let sourceArgs = [
-                        ['-re'],
-                        ['-headers', `Authorization: Bearer ${this.ss3Camera.authManager.accessToken}`],
-                        ['-i', `https://${this.serverIpAddress}/v1/${this.ss3Camera.cameraDetails.uuid}/flv?x=${width}&audioEncoding=AAC`]
-                    ];
-
-                    let videoArgs = [
-                        ['-map', '0:0'],
-                        ['-vcodec', 'libx264'],
-                        ['-tune', 'zerolatency'],
-                        ['-preset', 'superfast'],
-                        ['-pix_fmt', 'yuv420p'],
-                        ['-r', fps],
-                        ['-f', 'rawvideo'],
-                        ['-vf', `scale=${width}:-2`],
-                        ['-b:v', `${videoBitrate}k`],
-                        ['-bufsize', `${2*videoBitrate}k`],
-                        ['-maxrate', `${videoBitrate}k`],
-                        ['-payload_type', 99],
-                        ['-ssrc', sessionInfo.video_ssrc],
-                        ['-f', 'rtp'],
-                        ['-srtp_out_suite', 'AES_CM_128_HMAC_SHA1_80'],
-                        ['-srtp_out_params', sessionInfo.video_srtp.toString('base64')],
-                        [`srtp://${sessionInfo.address}:${sessionInfo.video_port}?rtcpport=${sessionInfo.video_port}&localrtcpport=${sessionInfo.video_port}&pkt_size=${mtu}`]
-                    ];
-
-                    let audioArgs = [
-                        ['-map', '0:1'],
-                        ['-acodec', 'libfdk_aac'],
-                        ['-flags', '+global_header'],
-                        ['-profile:a', 'aac_eld'],
-                        ['-ac', '1'],
-                        ['-ar', `${audioSamplerate}k`],
-                        ['-b:a', `${audioBitrate}k`],
-                        ['-bufsize', `${2*audioBitrate}k`],
-                        ['-payload_type', 110],
-                        ['-ssrc', sessionInfo.audio_ssrc],
-                        ['-f', 'rtp'],
-                        ['-srtp_out_suite', 'AES_CM_128_HMAC_SHA1_80'],
-                        ['-srtp_out_params', sessionInfo.audio_srtp.toString('base64')],
-                        [`srtp://${sessionInfo.address}:${sessionInfo.audio_port}?rtcpport=${sessionInfo.audio_port}&localrtcpport=${sessionInfo.audio_port}&pkt_size=188`]
-                    ];
-
-                    if (isDocker() && (!this.ss3Camera.cameraOptions || !this.ss3Camera.cameraOptions.ffmpegPath)) { // if docker and no custom binary specified
-                        if (this.ss3Camera.debug) this.log('Detected running in docker container with bundled binary, limiting to 720px wide');
-                        width = Math.min(width, 720);
-                        let vFilterArg = videoArgs.find(arg => arg[0] == '-vf');
-                        vFilterArg[1] = `scale=${width}:-2`;
-                    }
-
-                    if (request.audio && request.audio.codec == 'OPUS') {
-                        // Request is for OPUS codec, serve that
-                        let iArg = sourceArgs.find(arg => arg[0] == '-i');
-                        iArg[1] = iArg[1].replace('&audioEncoding=AAC', '');
-                        let aCodecArg = audioArgs.find(arg => arg[0] == '-acodec');
-                        aCodecArg[1] = 'libopus';
-                        let profileArg = audioArgs.find(arg => arg[0] == '-profile:a');
-                        audioArgs.splice(audioArgs.indexOf(profileArg), 1);
-                    }
-
-                    if (this.ss3Camera.cameraOptions) {
-                        if (this.ss3Camera.cameraOptions.enableHwaccelRpi) {
-                            let iArg = sourceArgs.find(arg => arg[0] == '-i');
-                            sourceArgs.splice(sourceArgs.indexOf(iArg), 0, ['-vcodec', 'h264_mmal']);
-                            let vCodecArg = videoArgs.find(arg => arg[0] == '-vcodec');
-                            vCodecArg[1] = 'h264_omx';
-                            videoArgs = videoArgs.filter(arg => arg[0] !== '-tune');
-                            videoArgs = videoArgs.filter(arg => arg[0] !== '-preset');
-                        }
-
-                        if (this.ss3Camera.cameraOptions.sourceOptions) {
-                            let options = (typeof this.ss3Camera.cameraOptions.sourceOptions === 'string') ? Object.fromEntries(this.ss3Camera.cameraOptions.sourceOptions.split('-').filter(x => x).map(arg => '-' + arg).map(a => a.split(' ').filter(x => x)))
-                                : this.ss3Camera.cameraOptions.sourceOptions; // support old config schema
-                            for (let key in options) {
-                                let value = options[key];
-                                let existingArg = sourceArgs.find(arg => arg[0] === key);
-                                if (existingArg) {
-                                    if (value === false) {
-                                        sourceArgs = sourceArgs.filter(arg => arg[0] !== key);
-                                    } else {
-                                        existingArg[1] = options[key];
-                                    }
-                                } else {
-                                    sourceArgs.unshift([key, options[key]]);
-                                }
-                            }
-                        }
-
-                        if (this.ss3Camera.cameraOptions.videoOptions) {
-                            let options = (typeof this.ss3Camera.cameraOptions.videoOptions === 'string') ? Object.fromEntries(this.ss3Camera.cameraOptions.videoOptions.split('-').filter(x => x).map(arg => '-' + arg).map(a => a.split(' ').filter(x => x)))
-                                : this.ss3Camera.cameraOptions.videoOptions; // support old config schema
-                            for (let key in options) {
-                                let value = options[key];
-                                let existingArg = videoArgs.find(arg => arg[0] === key);
-                                if (existingArg) {
-                                    if (value === false) {
-                                        videoArgs = videoArgs.filter(arg => arg[0] !== key);
-                                    } else {
-                                        existingArg[1] = options[key];
-                                    }
-                                } else {
-                                    videoArgs.push([key, options[key]]);
-                                }
-                            }
-                        }
-
-                        if (this.ss3Camera.cameraOptions.audioOptions) {
-                            let options = (typeof this.ss3Camera.cameraOptions.audioOptions === 'string') ? Object.fromEntries(this.ss3Camera.cameraOptions.audioOptions.split('-').filter(x => x).map(arg => '-' + arg).map(a => a.split(' ').filter(x => x)))
-                                : this.ss3Camera.cameraOptions.audioOptions; // support old config schema
-                            for (let key in options) {
-                                let value = options[key];
-                                let existingArg = audioArgs.find(arg => arg[0] === key);
-                                if (existingArg) {
-                                    if (value === false) {
-                                        audioArgs = audioArgs.filter(arg => arg[0] !== key);
-                                    } else {
-                                        existingArg[1] = options[key];
-                                    }
-                                } else {
-                                    audioArgs.push([key, options[key]]);
-                                }
-                            }
-                        }
-                    }
-
-                    let source = [].concat(...sourceArgs.map(arg => arg.map(a => typeof a == 'string' ? a.trim() : a)));
-                    let video = [].concat(...videoArgs.map(arg => arg.map(a => typeof a == 'string' ? a.trim() : a)));
-                    let audio = [].concat(...audioArgs.map(arg => arg.map(a => typeof a == 'string' ? a.trim() : a)));
 
                     try {
+                        let { source, video, audio } = this.buildLegacyStreamArgs(request, sessionInfo);
                         let cmd = spawn(this.ss3Camera.ffmpegPath, [
                             ...source,
                             ...video,
@@ -467,7 +380,7 @@ class StreamingDelegate {
     
                         if (this.ss3Camera.debug) {
                             this.log(`Start streaming video for camera '${this.ss3Camera.name}'`);
-                            this.log([this.ss3Camera.ffmpegPath, source.join(' '), video.join(' '), audio.join(' ')].join(' '));
+                            this.log(redactFfmpegArgs([this.ss3Camera.ffmpegPath, ...source, ...video, ...audio]).join(' '));
                         }
     
                         let started = false;
@@ -510,6 +423,8 @@ class StreamingDelegate {
                         this.log.error(`Unable to spawn ffmpeg process at ${this.ss3Camera.ffmpegPath} with error:`, e);
                         callback(e);
                     }
+                } else {
+                    callback(new Error('No pending session for stream start'));
                 }
 
                 delete this.pendingSessions[sessionIdentifier];
@@ -533,6 +448,110 @@ class StreamingDelegate {
                 callback();
             }
         }
+    }
+
+    // ffmpeg arguments for the cameras streamed from media.simplisafe.com (SimpliCam, Video Doorbell Pro)
+    buildLegacyStreamArgs(request, sessionInfo) {
+        let width = request.video.width ?? 1920;
+        let fps = this.cameraDetails.cameraSettings.admin.fps;
+        let videoBitrate = this.cameraDetails.cameraSettings.admin.bitRate;
+        let audioBitrate = request.audio.max_bit_rate ?? 96;
+        let audioSamplerate = request.audio.sample_rate ?? 16;
+        let mtu = request.video.mtu ?? 1316;
+
+        if (request.video.fps < fps) {
+            fps = request.video.fps;
+        }
+        if (request.video.max_bit_rate < videoBitrate) {
+            videoBitrate = request.video.max_bit_rate;
+        }
+
+        let sourceArgs = [
+            // Take the frame rate from the stream metadata rather than probing 2s of video, and decode
+            // without frame threading, which holds back a frame per thread. No -re, on a live source it
+            // keeps the startup backlog as delay for the whole session
+            ['-fpsprobesize', '0'],
+            ['-analyzeduration', '1000000'],
+            ['-flags', 'low_delay'],
+            ['-headers', `Authorization: Bearer ${this.ss3Camera.authManager.accessToken}`],
+            ['-i', `https://${this.serverIpAddress}/v1/${this.cameraDetails.uuid}/flv?x=${width}&audioEncoding=AAC`]
+        ];
+
+        let videoArgs = [
+            ['-map', '0:v:0'],
+            ['-vcodec', 'libx264'],
+            ['-tune', 'zerolatency'],
+            ['-preset', 'superfast'],
+            ['-pix_fmt', 'yuv420p'],
+            ['-r', fps],
+            ['-g', fps * 2], // a keyframe every 2s so the picture recovers quickly after packet loss
+            ['-f', 'rawvideo'],
+            ['-vf', `scale=${width}:-2`],
+            ['-b:v', `${videoBitrate}k`],
+            ['-bufsize', `${2*videoBitrate}k`],
+            ['-maxrate', `${videoBitrate}k`],
+            ['-payload_type', videoPayloadType],
+            ['-ssrc', sessionInfo.video_ssrc],
+            ['-f', 'rtp'],
+            ['-srtp_out_suite', 'AES_CM_128_HMAC_SHA1_80'],
+            ['-srtp_out_params', sessionInfo.video_srtp.toString('base64')],
+            [`srtp://${sessionInfo.address}:${sessionInfo.video_port}?rtcpport=${sessionInfo.video_port}&localrtcpport=${sessionInfo.video_port}&pkt_size=${mtu}`]
+        ];
+
+        let audioArgs = [
+            ['-map', '0:a:0'],
+            ['-acodec', 'libfdk_aac'],
+            ['-flags', '+global_header'],
+            ['-profile:a', 'aac_eld'],
+            ['-ac', '1'],
+            ['-ar', `${audioSamplerate}k`],
+            ['-b:a', `${audioBitrate}k`],
+            ['-bufsize', `${2*audioBitrate}k`],
+            ['-payload_type', audioPayloadType],
+            ['-ssrc', sessionInfo.audio_ssrc],
+            ['-f', 'rtp'],
+            ['-srtp_out_suite', 'AES_CM_128_HMAC_SHA1_80'],
+            ['-srtp_out_params', sessionInfo.audio_srtp.toString('base64')],
+            [`srtp://${sessionInfo.address}:${sessionInfo.audio_port}?rtcpport=${sessionInfo.audio_port}&localrtcpport=${sessionInfo.audio_port}&pkt_size=188`]
+        ];
+
+        if (isDocker() && (!this.cameraOptions || !this.cameraOptions.ffmpegPath)) { // if docker and no custom binary specified
+            if (this.ss3Camera.debug) this.log('Detected running in docker container with bundled binary, limiting to 720px wide');
+            width = Math.min(width, 720);
+            let vFilterArg = videoArgs.find(arg => arg[0] == '-vf');
+            vFilterArg[1] = `scale=${width}:-2`;
+        }
+
+        if (request.audio && request.audio.codec == 'OPUS') {
+            // Request is for OPUS codec, serve that
+            let iArg = sourceArgs.find(arg => arg[0] == '-i');
+            iArg[1] = iArg[1].replace('&audioEncoding=AAC', '');
+            let aCodecArg = audioArgs.find(arg => arg[0] == '-acodec');
+            aCodecArg[1] = 'libopus';
+            let profileArg = audioArgs.find(arg => arg[0] == '-profile:a');
+            audioArgs.splice(audioArgs.indexOf(profileArg), 1);
+        }
+
+        if (this.cameraOptions) {
+            if (this.cameraOptions.enableHwaccelRpi) {
+                let iArg = sourceArgs.find(arg => arg[0] == '-i');
+                sourceArgs.splice(sourceArgs.indexOf(iArg), 0, ['-vcodec', 'h264_mmal']);
+                let vCodecArg = videoArgs.find(arg => arg[0] == '-vcodec');
+                vCodecArg[1] = 'h264_omx';
+                videoArgs = videoArgs.filter(arg => arg[0] !== '-tune');
+                videoArgs = videoArgs.filter(arg => arg[0] !== '-preset');
+            }
+
+            sourceArgs = applyFfmpegOptions(sourceArgs, this.cameraOptions.sourceOptions, 'input');
+            videoArgs = applyFfmpegOptions(videoArgs, this.cameraOptions.videoOptions, 'output');
+            audioArgs = applyFfmpegOptions(audioArgs, this.cameraOptions.audioOptions, 'output');
+        }
+
+        return {
+            source: flattenFfmpegArgs(sourceArgs),
+            video: flattenFfmpegArgs(videoArgs),
+            audio: flattenFfmpegArgs(audioArgs)
+        };
     }
 
     createSrtpSession(keyAndSalt) {
@@ -586,78 +605,44 @@ class StreamingDelegate {
         });
     }
 
-    async handleLiveKitSnapshotRequest(callback) {
-        if (this.cachedSnapshot && Date.now() < this.cachedSnapshotExpires) {
-            callback(undefined, this.cachedSnapshot);
-            return;
-        }
-
-        // A stream is already collecting keyframes, serve what we have rather than joining again
-        if (this.cachedSnapshot && Object.keys(this.liveKitSessions).length) {
-            callback(undefined, this.cachedSnapshot);
-            return;
-        }
-
-        if (this.simplisafe.isBlocked && Date.now() < this.simplisafe.nextAttempt) {
-            callback(new Error('Camera snapshot request blocked (rate limited)'));
-            return;
-        }
-
-        try {
-            if (!this.snapshotWarming) this.snapshotWarming = this.warmSnapshot();
-            let snapshot = await this.snapshotWarming;
-            callback(undefined, snapshot);
-        } catch (err) {
-            this.log.error(`Could not get snapshot for '${this.ss3Camera.name}':`, err.message);
-            callback(err);
-        }
-    }
-
     // Briefly joins the room to grab a keyframe, used when nothing is streaming
     async warmSnapshot() {
         let source = new LiveKitSource(this.ss3Camera);
         let keyframe = new KeyframeCollector();
 
-        let timeoutID;
-        let captured = new Promise((resolve, reject) => {
-            timeoutID = setTimeout(() => reject(new Error('Timed out waiting for a keyframe')), keyframeTimeout);
+        let captured = new Promise(resolve => {
             source.onVideoRtp = rtp => {
                 keyframe.push(rtp.payload, rtp.header);
                 if (keyframe.complete) resolve(keyframe.annexB());
             };
         });
-        // connect() may reject before this is ever awaited, so it always needs a handler
-        captured.catch(() => {});
 
+        let timeoutID;
         try {
-            await source.connect();
-            let annexB = await captured;
+            await source.connect(liveKitSnapshotTimeout);
+            let annexB = await Promise.race([captured, new Promise((resolve, reject) => {
+                timeoutID = setTimeout(() => reject(new Error('Timed out waiting for a keyframe')), keyframeTimeout);
+            })]);
             let jpeg = await this.jpegFromKeyframe(annexB);
 
-            this.cachedSnapshot = jpeg;
-            this.cachedSnapshotExpires = Date.now() + snapshotCacheTime;
             if (this.ss3Camera.debug) this.log(`Cached snapshot for '${this.ss3Camera.name}' (${Math.round(jpeg.length / 1000)}kB)`);
             return jpeg;
         } finally {
             clearTimeout(timeoutID);
             source.close();
-            this.snapshotWarming = null;
         }
     }
 
     // Caches a snapshot from a stream already in flight, costs one decoded frame
     cacheSnapshotFromStream(keyframe) {
-        if (this.snapshotBusy || Date.now() < this.cachedSnapshotExpires) return;
+        if (this.snapshotBusy || this.snapshots.age() < streamSnapshotInterval) return;
 
         this.snapshotBusy = true;
         let annexB = keyframe.annexB();
         keyframe.reset();
 
         this.jpegFromKeyframe(annexB)
-            .then(jpeg => {
-                this.cachedSnapshot = jpeg;
-                this.cachedSnapshotExpires = Date.now() + snapshotCacheTime;
-            })
+            .then(jpeg => this.snapshots.set(jpeg))
             .catch(err => {
                 if (this.ss3Camera.debug) this.log.error('Snapshot decode failed:', err.message);
             })
@@ -695,7 +680,7 @@ class StreamingDelegate {
         this.liveKitSessions[sessionIdentifier] = session;
 
         source.onVideoRtp = rtp => {
-            if (!this.cachedSnapshot || Date.now() >= this.cachedSnapshotExpires) {
+            if (this.snapshots.age() >= streamSnapshotInterval) {
                 keyframe.push(rtp.payload, rtp.header);
                 if (keyframe.complete) this.cacheSnapshotFromStream(keyframe);
             }

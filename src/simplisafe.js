@@ -30,6 +30,9 @@ export const SENSOR_TYPES = {
     'SIREN': 11,
     'SIREN_2': 13,
     'DOORLOCK': 16,
+    // cameras paired to the base station are listed as sensors too, they are set up from the camera list
+    'OUTDOOR_CAMERA': 17,
+    'OUTDOOR_CAMERA_2': 23,
     'DOORLOCK_2': 253
 };
 
@@ -54,6 +57,9 @@ export const EVENT_TYPES = {
     USER_INITIATED_TEST: 'USER_INITIATED_TEST',
 };
 
+// Emitted with the alarm system whenever it is fetched, it also carries the cameras' battery and charging state
+export const SYSTEM_UPDATED = 'SYSTEM_UPDATED';
+
 export class RateLimitError extends Error {
     constructor(...params) {
         super(...params);
@@ -72,18 +78,23 @@ const rateLimitMaxInterval = 2 * 60 * 60 * 1000; // ms
 const sensorRefreshLockoutDuration = 20000; // ms
 const errorSuppressionDuration = 5 * 60 * 1000; // ms
 const alarmRefreshInterval = 62000; // ms, avoid overlap with sensor refresh
+const alarmStateMaxAge = 60000; // ms a known alarm state is used without asking SimpliSafe again
+const apiTimeout = 30000; // ms
+const appHubTimeout = 15000; // ms
 
 const wsUrl = 'wss://socketlink.prd.aser.simplisafe.com';
 const socketRetryInterval = 1000; //ms
 const socketHeartbeatInterval = 60 * 1000; //ms
 
 const ssApi = axios.create({
-    baseURL: 'https://api.simplisafe.com/v1'
+    baseURL: 'https://api.simplisafe.com/v1',
+    timeout: apiTimeout
 });
 
 const pluginUserAgent = 'homebridge-simplisafe3';
 const appHubApi = axios.create({
     baseURL: 'https://app-hub.prd.aser.simplisafe.com',
+    timeout: appHubTimeout,
     headers: {
         'User-Agent': pluginUserAgent,
         'Accept': 'application/json, text/plain, */*'
@@ -117,6 +128,9 @@ class SimpliSafe3 extends EventEmitter {
     isBlocked;
     nextBlockInterval = rateLimitInitialInterval;
     nextAttempt = 0;
+    lastAlarmState = null;
+    lastAlarmStateAt = 0;
+    alarmStateRefresh = null;
 
     constructor(sensorRefreshTime = 15000, authManager, storagePath, log, debug) {
         super();
@@ -132,6 +146,64 @@ class SimpliSafe3 extends EventEmitter {
         axiosRetry(ssApi, { retries: 2 });
 
         this.resetRateLimitHandler();
+
+        // every camera and sensor listens for events
+        this.setMaxListeners(100);
+        this.trackAlarmState();
+    }
+
+    // Keeps the alarm state from realtime events, mirroring the alarm accessory, so camera snapshots can
+    // decide on the privacy shutter without a request
+    trackAlarmState() {
+        const fromControl = data => data && [SENSOR_TYPES.APP, SENSOR_TYPES.KEYPAD, SENSOR_TYPES.KEYCHAIN, SENSOR_TYPES.DOORLOCK].includes(data.sensorType);
+        const states = {
+            [EVENT_TYPES.ALARM_DISARM]: 'OFF',
+            [EVENT_TYPES.ALARM_CANCEL]: 'OFF',
+            [EVENT_TYPES.ALARM_OFF]: 'OFF',
+            [EVENT_TYPES.HOME_ARM]: 'HOME',
+            [EVENT_TYPES.AWAY_ARM]: 'AWAY',
+            [EVENT_TYPES.HOME_EXIT_DELAY]: 'HOME_COUNT',
+            [EVENT_TYPES.AWAY_EXIT_DELAY]: 'AWAY_COUNT'
+        };
+        for (const [event, state] of Object.entries(states)) {
+            this.on(event, data => {
+                if (fromControl(data)) this.recordAlarmState(state);
+            });
+        }
+        this.on(EVENT_TYPES.ALARM_TRIGGER, () => this.recordAlarmState('ALARM'));
+    }
+
+    recordAlarmState(state) {
+        if (!state) return;
+        this.lastAlarmState = state;
+        this.lastAlarmStateAt = Date.now();
+    }
+
+    // The alarm state if it is known, without waiting on SimpliSafe when an older one can be used.
+    // Resolves null if it cannot be found within timeout ms
+    async getRecentAlarmState(timeout = 3000) {
+        if (this.lastAlarmState && Date.now() - this.lastAlarmStateAt < alarmStateMaxAge) return this.lastAlarmState;
+
+        if (!this.alarmStateRefresh) {
+            this.alarmStateRefresh = this.getAlarmSystem()
+                .then(system => system.alarmState)
+                .finally(() => { this.alarmStateRefresh = null; });
+            this.alarmStateRefresh.catch(() => {});
+        }
+
+        if (this.lastAlarmState) return this.lastAlarmState; // refreshed for next time
+
+        let timeoutID;
+        try {
+            return await Promise.race([
+                this.alarmStateRefresh,
+                new Promise(resolve => { timeoutID = setTimeout(() => resolve(null), timeout); })
+            ]);
+        } catch (err) {
+            return null;
+        } finally {
+            clearTimeout(timeoutID);
+        }
     }
 
     resetRateLimitHandler() {
@@ -285,7 +357,10 @@ class SimpliSafe3 extends EventEmitter {
         let subscription = await this.getSubscription(forceRefresh);
 
         if (subscription.location && subscription.location.system) {
-            return subscription.location.system;
+            let system = subscription.location.system;
+            this.recordAlarmState(system.alarmState);
+            this.emit(SYSTEM_UPDATED, system);
+            return system;
         } else {
             throw new Error('Subscription format not understood:', subscription);
         }
@@ -535,6 +610,7 @@ class SimpliSafe3 extends EventEmitter {
                     // Ignore event as it doesn't relate to this account
                     return;
                 }
+                if (this.debug) this.log(`SSAPI event ${data.eventCid} (${data.eventType}) from sensor type ${data.sensorType} serial ${data.sensorSerial}${data.internal && data.internal.mainCamera ? `, camera ${data.internal.mainCamera}` : ''}`);
 
                 switch (data.eventType) {
                 case 'alarm':
