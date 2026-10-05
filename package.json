@@ -1,17 +1,18 @@
 {
-  "name": "homebridge-simplisafe3",
-  "version": "1.11.2",
-  "description": "A complete Homebridge plugin for the SimpliSafe 3 security system",
-  "author": "Niccolò Zapponi, shamoon",
+  "name": "homebridge-simplisafe3-edited",
+  "displayName": "SimpliSafe 3 (Edited)",
+  "version": "1.12.0-beta.1",
+  "description": "SimpliSafe 3 for Homebridge with faster cameras and Outdoor Camera support. Installs alongside homebridge-simplisafe3.",
+  "author": "Niccol\u00f2 Zapponi, shamoon",
   "funding": {
     "type": "github",
     "url": "https://github.com/sponsors/shamoon"
   },
   "bin": {
-    "homebridge-simplisafe3": "./bin/run"
+    "homebridge-simplisafe3-edited": "./bin/run"
   },
   "bugs": {
-    "url": "https://github.com/homebridge-simplisafe3/homebridge-simplisafe3/issues"
+    "url": "https://github.com/williamorman-oss/Edited-homebridge-simplisafe3/issues"
   },
   "dependencies": {
     "@homebridge/plugin-ui-utils": "0.0.19",
@@ -56,7 +57,7 @@
     "/images",
     "/README.md"
   ],
-  "homepage": "https://github.com/homebridge-simplisafe3/homebridge-simplisafe3#readme",
+  "homepage": "https://github.com/williamorman-oss/Edited-homebridge-simplisafe3#readme",
   "keywords": [
     "homebridge",
     "homebridge-plugin",
@@ -68,15 +69,16 @@
   "main": "index.js",
   "oclif": {
     "commands": "./commands",
-    "bin": "homebridge-simplisafe3",
+    "bin": "homebridge-simplisafe3-edited",
     "plugins": [
       "@oclif/plugin-help"
     ]
   },
-  "repository": "git+https://github.com/homebridge-simplisafe3/homebridge-simplisafe3.git",
+  "repository": "git+https://github.com/williamorman-oss/Edited-homebridge-simplisafe3.git",
   "scripts": {
     "build": "rm -rf dist && babel src -d dist --extensions .js,.ts && cp -r package.json config.schema.json homebridge-ui bin images README.md dist/",
     "deploy": "npm publish dist/",
+    "pack": "npm run build && cp package-lock.json dist/npm-shrinkwrap.json && mkdir -p releases && npm pack ./dist --pack-destination releases",
     "start": "nodemon --exec babel-node src/index.js",
     "test": "npm run build && npm run test:unit",
     "test:unit": "node --test test/*.test.cjs",

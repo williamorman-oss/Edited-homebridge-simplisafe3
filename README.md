@@ -14,6 +14,25 @@ An [unofficial] [Homebridge](https://github.com/homebridge/homebridge) plugin to
 
 </span>
 
+## About this edited version
+This is a fork of [homebridge-simplisafe3](https://github.com/homebridge-simplisafe3/homebridge-simplisafe3) with faster cameras and better Outdoor Camera support (see the [change log](CHANGELOG.md)). It is packaged as **homebridge-simplisafe3-edited** so it can be installed **next to** the original plugin without touching it:
+
+- its own platform (`SimpliSafe 3 Edited`) and its own SimpliSafe login (`simplisafe3auth-edited.json`), so the two never sign each other out
+- by default it only adds cameras (`camerasOnly`), so the alarm, sensors and locks stay with the original plugin
+
+### Installing alongside the original
+1. In the Homebridge UI open the terminal (top right menu, **Terminal**) and run:
+   ```
+   npm install --prefix /var/lib/homebridge https://github.com/williamorman-oss/Edited-homebridge-simplisafe3/raw/master/releases/homebridge-simplisafe3-edited-1.12.0-beta.1.tgz
+   ```
+   Use your Homebridge storage folder if it is not `/var/lib/homebridge` (e.g. `/homebridge` in Docker). Before this is merged, replace `master` with `outdoor-cameras-batch1`.
+2. Restart Homebridge. **SimpliSafe 3 (Edited)** appears under Plugins.
+3. Open its settings and log in to SimpliSafe (this is a separate login from the original plugin). Save.
+4. Under the plugin's **Bridge Settings**, turn on the child bridge and restart Homebridge.
+5. In the Home app add the new bridge (Add Accessory, then scan the child bridge's QR code from the Homebridge UI).
+
+To avoid every camera being handled twice, turn off `cameras` (or exclude the cameras) in the original plugin once you are happy with this one. To remove this version, uninstall **SimpliSafe 3 (Edited)** from the Plugins page and remove its bridge from the Home app.
+
 ## Requirements
 - Works with native Homebridge and [oznu/docker-homebridge](https://github.com/oznu/docker-homebridge).
 - Compatible with the official [Config UI X plugin](https://github.com/oznu/homebridge-config-ui-x) which is **recommended for easiest usage**.

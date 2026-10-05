@@ -12,8 +12,9 @@ import DoorLock from './accessories/doorLock';
 import Camera from './accessories/camera';
 import UnreachableAccessory from './accessories/unreachableAccessory';
 
-const PLUGIN_NAME = 'homebridge-simplisafe3';
-const PLATFORM_NAME = 'SimpliSafe 3';
+// Named apart from homebridge-simplisafe3 so both can be installed and run side by side
+const PLUGIN_NAME = 'homebridge-simplisafe3-edited';
+const PLATFORM_NAME = 'SimpliSafe 3 Edited';
 
 const cameraRefreshInterval = 10 * 60 * 1000; // ms, keeps camera battery and charging state current
 

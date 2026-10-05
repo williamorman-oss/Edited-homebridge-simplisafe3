@@ -30,7 +30,7 @@ test('plugin initializer registers the platform with homebridge', () => {
     assert.equal(calls.length, 1);
     const [pluginName, platformName, constructor, dynamic] = calls[0];
     assert.equal(pluginName, distPackage.name);
-    assert.equal(platformName, 'SimpliSafe 3');
+    assert.equal(platformName, 'SimpliSafe 3 Edited');
     assert.equal(typeof constructor, 'function');
     assert.equal(dynamic, true);
 });

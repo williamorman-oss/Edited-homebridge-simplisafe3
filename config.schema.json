@@ -1,8 +1,8 @@
 {
-  "pluginAlias": "homebridge-simplisafe3.SimpliSafe 3",
+  "pluginAlias": "homebridge-simplisafe3-edited.SimpliSafe 3 Edited",
   "pluginType": "platform",
   "singular": true,
-  "headerDisplay": "*Please note this plugin requires an active SimpliSafe 'interactive' monitoring plan.*",
+  "headerDisplay": "*Please note this plugin requires an active SimpliSafe 'interactive' monitoring plan.* This edited version runs alongside homebridge-simplisafe3 with its own SimpliSafe login. Enable it as a child bridge (Bridge Settings) and pair that bridge in the Home app.",
   "customUi": true,
   "schema": {
     "type": "object",
@@ -11,19 +11,19 @@
         "title": "Name",
         "type": "string",
         "required": true,
-        "default": "Home Alarm",
-        "placeholder": "e.g. Home Alarm"
+        "default": "SimpliSafe Cameras",
+        "placeholder": "e.g. SimpliSafe Cameras"
       },
       "cameras": {
         "title": " Cameras",
         "type": "boolean",
-        "default": false,
+        "default": true,
         "description": "Enable camera support."
       },
       "camerasOnly": {
         "title": " Cameras Only",
         "type": "boolean",
-        "default": false,
+        "default": true,
         "description": "Only add cameras, not the alarm, sensors or locks. Use this to run the cameras on their own child bridge, so camera snapshots never hold up the alarm."
       },
       "debug": {
