@@ -629,10 +629,13 @@ class StreamingDelegate {
     }
 
     // Re-stamp RTP for HomeKit then encrypt with the keys it gave us in prepareStream.
-    // The packet is shared with other live views and the snapshot, so it is copied rather than changed
+    // The packet is shared with other live views and the snapshot, so it is copied rather than changed.
+    // werift has already stripped any padding from the payload, so the copy must not claim padding, and
+    // LiveKit's padding-only packets (bandwidth probes) carry nothing for HomeKit
     forwardRtp(rtp, srtp, socket, payloadType, ssrc, port, address) {
+        if (!rtp.payload || !rtp.payload.length) return;
         try {
-            let header = new RtpHeader({ ...rtp.header, payloadType: payloadType, ssrc: ssrc, extension: false, extensions: [] });
+            let header = new RtpHeader({ ...rtp.header, payloadType: payloadType, ssrc: ssrc, extension: false, extensions: [], padding: false, paddingSize: 0 });
             socket.send(srtp.encrypt(rtp.payload, header), port, address);
         } catch (e) {
             if (this.ss3Camera.debug) this.log.error('Error forwarding RTP to HomeKit:', e.message);

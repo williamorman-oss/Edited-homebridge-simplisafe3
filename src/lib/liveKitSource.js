@@ -31,6 +31,7 @@ class LiveKitSource extends EventEmitter {
         this.videoTrack = null;
         this.videoSsrc = null;
         this.lastKeyframeRequest = 0;
+        this.keyframeRequestID = null;
     }
 
     _sessionEnded(reason) {
@@ -225,11 +226,23 @@ class LiveKitSource extends EventEmitter {
     // waits for the camera's next scheduled one before there is a picture
     requestKeyframe() {
         if (this.closed || !this.pc || this.videoSsrc === null) return false;
-        if (Date.now() - this.lastKeyframeRequest < keyframeRequestInterval) return false;
+
+        // asked less than a second ago, that keyframe may already have gone by, so ask again once allowed
+        const wait = this.lastKeyframeRequest + keyframeRequestInterval - Date.now();
+        if (wait > 0) {
+            if (!this.keyframeRequestID) {
+                this.keyframeRequestID = setTimeout(() => {
+                    this.keyframeRequestID = null;
+                    this.requestKeyframe();
+                }, wait);
+            }
+            return false;
+        }
 
         const receivers = this.pc.getTransceivers().filter(t => t.kind === 'video').map(t => t.receiver);
         const receiver = receivers.find(r => r.track === this.videoTrack) || receivers[0];
-        if (!receiver) return false;
+        // werift silently sends nothing unless LiveKit offered picture loss feedback
+        if (!receiver || !receiver.pliEnabled) return false;
 
         this.lastKeyframeRequest = Date.now();
         receiver.sendRtcpPLI(this.videoSsrc).catch(() => {});
@@ -242,6 +255,8 @@ class LiveKitSource extends EventEmitter {
         this.closed = true;
 
         clearInterval(this.pingIntervalID);
+        clearTimeout(this.keyframeRequestID);
+        this.keyframeRequestID = null;
         this.streaming = false;
         this.removeAllListeners();
 

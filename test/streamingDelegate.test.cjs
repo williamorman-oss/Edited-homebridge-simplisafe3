@@ -658,3 +658,25 @@ test('forwarding re-stamps a copy, the packet other viewers get is unchanged', (
     assert.equal(header.ssrc, 1234);
     assert.equal(header.extension, true);
 });
+
+test('padding stripped by werift is not claimed to HomeKit, padding-only probes are not forwarded', () => {
+    const { RtpHeader, RtpPacket } = require('werift');
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
+    const key = Buffer.alloc(30, 7);
+    const encrypt = delegate.createSrtpSession(key);
+    const decrypt = delegate.createSrtpSession(key);
+    const sent = [];
+    const socket = { send: (buf) => sent.push(buf) };
+
+    // as LiveKit sends it: 4 bytes of padding, the payload's last byte would read as a padding count
+    const padded = RtpPacket.deSerialize(new RtpPacket(new RtpHeader({ payloadType: 96, ssrc: 1, sequenceNumber: 9, padding: true, paddingSize: 4 }), Buffer.from([0x65, 1, 2, 7])).serialize());
+    assert.equal(padded.payload.length, 4);
+    delegate.forwardRtp(padded, encrypt, socket, 99, 5555, 5010, '192.168.1.5');
+
+    const received = RtpPacket.deSerialize(decrypt.decrypt(sent[0]));
+    assert.deepEqual([...received.payload], [0x65, 1, 2, 7]);
+
+    const probe = RtpPacket.deSerialize(new RtpPacket(new RtpHeader({ payloadType: 96, ssrc: 1, sequenceNumber: 10, padding: true, paddingSize: 200 }), Buffer.alloc(0)).serialize());
+    delegate.forwardRtp(probe, encrypt, socket, 99, 5555, 5010, '192.168.1.5');
+    assert.equal(sent.length, 1);
+});

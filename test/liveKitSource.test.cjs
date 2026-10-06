@@ -122,22 +122,53 @@ test('a running session that dies tells every user once, after closing', () => {
     assert.deepEqual(ended, [['first', 'signalling closed', true], ['second', 'signalling closed', true]]);
 });
 
-test('a keyframe is requested from the video receiver for the SSRC seen, at most once a second', () => {
+test('a keyframe is requested from the video receiver for the SSRC seen, at most once a second', async () => {
     const source = new LiveKitSource(createCamera());
     assert.equal(source.requestKeyframe(), false, 'nothing to ask before joining');
 
     const receive = joinWithTracks(source);
     const plis = [];
-    const videoReceiver = { track: source.videoTrack, sendRtcpPLI: async (ssrc) => { plis.push(ssrc); } };
+    const videoReceiver = { track: source.videoTrack, pliEnabled: true, sendRtcpPLI: async (ssrc) => { plis.push(ssrc); } };
     source.pc.getTransceivers = () => [{ kind: 'audio', receiver: {} }, { kind: 'video', receiver: videoReceiver }];
     assert.equal(source.requestKeyframe(), false, 'no video yet');
 
     receive.video({ header: { ssrc: 4242 }, payload: Buffer.from([1]) });
     assert.equal(source.requestKeyframe(), true);
-    assert.equal(source.requestKeyframe(), false);
-    source.lastKeyframeRequest -= 1000;                    // a second later
-    assert.equal(source.requestKeyframe(), true);
+    assert.deepEqual(plis, [4242]);
 
-    assert.deepEqual(plis, [4242, 4242]);
+    // a second viewer within the second is not dropped, the request follows once allowed
+    source.lastKeyframeRequest = Date.now() - 950;
+    assert.equal(source.requestKeyframe(), false);
+    assert.equal(source.requestKeyframe(), false);
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    assert.deepEqual(plis, [4242, 4242], 'one follow-up request, however many asked');
+
     source.close();
+});
+
+test('no keyframe request is claimed when LiveKit did not offer picture loss feedback', () => {
+    const source = new LiveKitSource(createCamera());
+    const receive = joinWithTracks(source);
+    const videoReceiver = { track: source.videoTrack, pliEnabled: undefined, sendRtcpPLI: async () => assert.fail('werift would send nothing') };
+    source.pc.getTransceivers = () => [{ kind: 'video', receiver: videoReceiver }];
+    receive.video({ header: { ssrc: 4242 }, payload: Buffer.from([1]) });
+
+    assert.equal(source.requestKeyframe(), false);
+    source.close();
+});
+
+test('closing cancels a follow-up keyframe request', async () => {
+    const source = new LiveKitSource(createCamera());
+    const receive = joinWithTracks(source);
+    let plis = 0;
+    source.pc.getTransceivers = () => [{ kind: 'video', receiver: { track: source.videoTrack, pliEnabled: true, sendRtcpPLI: async () => { plis++; } } }];
+    receive.video({ header: { ssrc: 4242 }, payload: Buffer.from([1]) });
+
+    source.requestKeyframe();
+    source.lastKeyframeRequest = Date.now() - 950;
+    source.requestKeyframe();
+    source.close();
+    await new Promise((resolve) => setTimeout(resolve, 120));
+
+    assert.equal(plis, 1);
 });
