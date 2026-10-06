@@ -680,3 +680,43 @@ test('padding stripped by werift is not claimed to HomeKit, padding-only probes 
     delegate.forwardRtp(probe, encrypt, socket, 99, 5555, 5010, '192.168.1.5');
     assert.equal(sent.length, 1);
 });
+
+test('a viewer whose shared connection dropped before its start is told so, not left without video', async () => {
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
+    const created = useFakeLiveKit(delegate);
+    delegate.forwardRtp = () => {};
+    delegate.controller.forceStopStreamingSession = () => {};
+
+    await startLiveView(delegate, 'phone');
+    const source = created[0];
+    source.streaming = true;
+    source.connected();
+    await tick();
+
+    delegate.prepareStream(liveKitStreamRequest('tablet'), () => {});   // joins the running stream
+    const listeners = source.listeners('ended');
+    source.close();                                                        // the room goes away before 'start'
+    listeners.forEach((listener) => listener('signalling closed'));
+
+    const calls = [];
+    await delegate.handleStreamRequest({ sessionID: 'tablet', type: 'start', video: {}, audio: { codec: 'OPUS' } }, (...a) => calls.push(a));
+
+    assert.equal(calls.length, 1);
+    assert.ok(calls[0][0] instanceof Error);
+    assert.deepEqual(Object.keys(delegate.liveKitSessions), []);
+    assert.equal(delegate.canRefreshSnapshot(), true, 'snapshots keep refreshing');
+
+    await startLiveView(delegate, 'tablet-again');
+    assert.equal(created.length, 2, 'the next live view reconnects');
+});
+
+test('a stop for a live view that never started gives the connection back at once', async () => {
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
+    const created = useFakeLiveKit(delegate);
+
+    delegate.prepareStream(liveKitStreamRequest('dropped'), () => {});
+    await delegate.handleStreamRequest({ sessionID: 'dropped', type: 'stop' }, () => {});
+
+    assert.equal(created[0].closed, true);
+    assert.deepEqual(delegate.pendingSessions, {});
+});

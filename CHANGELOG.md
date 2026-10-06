@@ -1,6 +1,17 @@
 # Change Log
 All notable changes are documented here.
 
+## 1.12.0-beta.5, homebridge-simplisafe3-edited (2026-10-06)
+Install, or update an earlier beta, next to the original plugin (see the README):
+```
+INSTALL_COMMAND_PENDING
+```
+
+- Snapshots and live views of a LiveKit camera share one connection. A live view opened while a battery camera is being woken for a snapshot joins that wake-up instead of waking it again, and a second iPhone or iPad joins the first. The connection closes as soon as nothing uses it, so sharing never keeps a camera awake
+- A viewer joining a stream that is already running asks the camera for a keyframe, so the picture appears without waiting for the camera's next one
+- Fix: LiveKit video packets with padding reached HomeKit with bytes cut off the end, and LiveKit's padding-only bandwidth probes were forwarded as broken packets
+- A live view stopped before it started gives up its connection straight away
+
 ## 1.12.0-beta.4, homebridge-simplisafe3-edited (2026-10-06)
 Install, or update an earlier beta, next to the original plugin (see the README):
 ```

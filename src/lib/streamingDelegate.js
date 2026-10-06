@@ -492,6 +492,14 @@ class StreamingDelegate {
                 delete this.pendingSessions[sessionIdentifier];
 
             } else if (request.type == 'stop') {
+                // prepared but never started, give the connection back now rather than at the prepare timeout
+                let pending = this.pendingSessions[sessionIdentifier];
+                if (pending && pending.liveKit) {
+                    clearTimeout(pending.prepareTimeoutID);
+                    delete this.pendingSessions[sessionIdentifier];
+                    this.releaseLiveKitSource(pending.liveKit);
+                }
+
                 let cmd = this.ongoingSessions[sessionIdentifier];
                 try {
                     if (cmd) {
@@ -757,6 +765,15 @@ class StreamingDelegate {
 
     startLiveKitStream(request, sessionIdentifier, sessionInfo, callback) {
         clearTimeout(sessionInfo.prepareTimeoutID);
+
+        // the shared connection failed or dropped between prepare and start, nothing would ever arrive
+        if (sessionInfo.liveKit.source.closed) {
+            this.releaseLiveKitSource(sessionInfo.liveKit);
+            let err = new Error(`LiveKit connection to '${this.ss3Camera.name}' closed before the live view started`);
+            this.log.error(err.message);
+            callback(err);
+            return;
+        }
 
         if (this.simplisafe.isBlocked && Date.now() < this.simplisafe.nextAttempt) {
             this.releaseLiveKitSource(sessionInfo.liveKit);
