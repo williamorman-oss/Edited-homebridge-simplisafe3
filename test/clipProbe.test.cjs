@@ -93,3 +93,89 @@ test('a clip that has no segments yet, or is missing, is not readable and says w
     assert.equal(missing.readable, false);
     assert.equal(missing.status, 404);
 });
+
+// A response the test drives by hand
+function manualTransport() {
+    const calls = [];
+    return {
+        calls,
+        get(url, options, callback) {
+            const req = new EventEmitter();
+            req.destroyed = false;
+            req.destroy = () => { req.destroyed = true; };
+            calls.push({ url: url.toString(), options, req, respond: (res) => callback(res) });
+            return req;
+        },
+    };
+}
+const response = (statusCode, headers = {}) => Object.assign(new EventEmitter(), { statusCode, headers, resume() {} });
+
+test('a redirect to a link that cannot be read ends the request instead of crashing Homebridge', async () => {
+    for (const location of ['https://[bad', '//', 'https://exa^mple.com/', 'https://media.simplisafe.com:99999/x']) {
+        const transport = manualTransport();
+        const pending = httpGet('https://chronicle.simplisafe.com/clip', { token: 't', transport });
+        assert.doesNotThrow(() => transport.calls[0].respond(response(302, { location })));
+        assert.deepEqual(await pending, { host: 'chronicle.simplisafe.com', status: 302, error: 'bad redirect' }, location);
+        assert.equal(transport.calls[0].req.destroyed, true, 'the redirect body is not downloaded');
+    }
+});
+
+test('an error reply is closed at once rather than drained', async () => {
+    const transport = manualTransport();
+    const pending = httpGet('https://chronicle.simplisafe.com/clip', { token: 't', transport });
+    transport.calls[0].respond(response(404));
+    assert.deepEqual(await pending, { host: 'chronicle.simplisafe.com', status: 404 });
+    assert.equal(transport.calls[0].req.destroyed, true);
+});
+
+test('a body still arriving at the deadline is cut short with what has arrived', async () => {
+    const transport = manualTransport();
+    const pending = httpGet('https://chronicle.simplisafe.com/clip', { token: 't', transport, deadline: Date.now() + 80 });
+    const res = response(200);
+    transport.calls[0].respond(res);
+    res.emit('data', Buffer.from('first bytes'));
+
+    const result = await pending;
+    assert.equal(result.truncated, true);
+    assert.equal(result.body.toString(), 'first bytes');
+    assert.equal(transport.calls[0].req.destroyed, true);
+});
+
+test('a redirect followed is not undone by the first request closing afterwards', async () => {
+    const transport = manualTransport();
+    const pending = httpGet('https://chronicle.simplisafe.com/clip', { token: 't', transport });
+    transport.calls[0].respond(response(302, { location: 'https://bucket.s3.amazonaws.com/clip' }));
+    transport.calls[0].req.emit('error', new Error('socket hang up'));
+    const res = response(200);
+    transport.calls[1].respond(res);
+    res.emit('data', Buffer.from('media'));
+    res.emit('end');
+
+    const result = await pending;
+    assert.equal(result.status, 200);
+    assert.equal(result.body.toString(), 'media');
+    assert.equal(transport.calls[1].options.headers.Authorization, undefined);
+});
+
+test('ffmpeg only reads plain media formats from the pipe, so it never opens links in a manifest', async () => {
+    const { describeMedia } = require('../dist/lib/clipProbe');
+    let args;
+    const fake = () => {
+        const cmd = new EventEmitter();
+        cmd.stderr = new EventEmitter();
+        cmd.stdin = Object.assign(new EventEmitter(), { end: () => setImmediate(() => cmd.emit('close', 0)) });
+        cmd.kill = () => {};
+        return cmd;
+    };
+    await describeMedia('ffmpeg', Buffer.from('x'), { spawnProcess: (path, a) => { args = a; return fake(); } });
+
+    const whitelist = args.indexOf('-format_whitelist');
+    assert.ok(whitelist > -1 && whitelist < args.indexOf('-i'));
+    assert.equal(args[whitelist + 1], 'mov,mpegts,flv,live_flv');
+});
+
+test('the real ffmpeg refuses a DASH manifest from the pipe', async () => {
+    const { describeMedia } = require('../dist/lib/clipProbe');
+    const mpd = '<?xml version="1.0"?><MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"><Period><AdaptationSet><Representation id="1" bandwidth="1"><BaseURL>http://127.0.0.1:9/x.mp4</BaseURL></Representation></AdaptationSet></Period></MPD>';
+    assert.deepEqual(await describeMedia(require('ffmpeg-for-homebridge'), Buffer.from(mpd)), []);
+});

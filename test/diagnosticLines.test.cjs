@@ -109,3 +109,17 @@ test('every new line also survives redaction unchanged, so nothing relies on it'
     const lines = [cameraCapabilities(cameraDetails()), eventShape(motionEvent())];
     for (const line of lines) assert.equal(redact(line), line);
 });
+
+test('ffmpeg stream descriptions come from the input only, not repeated for the output', () => {
+    const stderr = [
+        "Input #0, mpegts, from 'pipe:0':",
+        '  Stream #0:0[0x100]: Video: h264 (Main), yuv420p, 1920x1080, 20 fps',
+        '  Stream #0:1[0x101]: Audio: aac (LC), 16000 Hz, mono',
+        'Stream mapping:',
+        '  Stream #0:0 -> #0:0 (copy)',
+        "Output #0, null, to 'pipe:':",
+        '  Stream #0:0: Video: h264 (Main), yuv420p, 1920x1080, q=2-31, 20 fps',
+        '  Stream #0:1: Audio: aac (LC), 16000 Hz, mono',
+    ].join('\n');
+    assert.deepEqual(ffmpegStreams(stderr), ['video h264 (Main), yuv420p, 1920x1080, 20 fps', 'audio aac (LC), 16000 Hz, mono']);
+});

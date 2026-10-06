@@ -227,3 +227,21 @@ test('a timeout blocks requests briefly without growing the block like a rate li
     assert.ok(ss.nextAttempt - Date.now() <= before);
     assert.equal(ss.nextBlockInterval, before);
 });
+
+test('an unexpected live-view reply is described by its field names, never its contents', async () => {
+    const { default: SimpliSafe3 } = loadSimplisafe({
+        requestImpl: async () => ({ data: {
+            signedChannelEndpoint: 'wss://m-1a2b.kinesisvideo.us-east-1.amazonaws.com/?X-Amz-ChannelARN=arn%3Aaws%3A611485993050%3Achannel%2Fabc_7654321&X-Amz-Signature=5d67',
+            clientId: 'user-4433221',
+            iceServers: [{ urls: ['turn:x'], username: '1791320000:djE6', credential: 'TURNPASSWORD' }],
+            cameraStatus: 'online',
+        } }),
+    });
+    const ss = new SimpliSafe3(15000, new FakeAuthManager(), '/tmp', createLogger(), false);
+    ss.subId = 7654321;
+
+    await assert.rejects(ss.getCameraLiveView('e15534806fb14446be20a948f11a9cfb'), (err) => {
+        assert.equal(err.message, 'Unexpected live-view response: fields signedChannelEndpoint,clientId,iceServers,cameraStatus, cameraStatus online');
+        return true;
+    });
+});

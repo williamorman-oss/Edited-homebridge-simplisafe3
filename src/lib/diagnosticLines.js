@@ -168,7 +168,9 @@ export function simplisafeUrl(href) {
 // The codec lines of ffmpeg's description of an input, without anything that could be a link
 export function ffmpegStreams(stderr) {
     const streams = [];
-    for (const match of String(stderr).matchAll(/Stream #\d+:\d+[^:]*: (Video|Audio): ([^\n]+)/g)) {
+    // with '-f null' ffmpeg lists every stream again under the output
+    const input = String(stderr).split(/\n(?:Output #|Stream mapping:)/)[0];
+    for (const match of input.matchAll(/^\s*Stream #\d+:\d+[^:]*: (Video|Audio): ([^\n]+)/gm)) {
         const description = match[2].replace(/\S*:\/\/\S*/g, '').replace(/\s+/g, ' ').trim().slice(0, 120);
         streams.push(`${match[1].toLowerCase()} ${description}`);
     }

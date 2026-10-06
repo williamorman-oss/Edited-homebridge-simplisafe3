@@ -239,3 +239,25 @@ test('the camera\'s H.264 profile, level and keyframe spacing are logged once, a
     source.close();
     assert.equal(lines.filter((line) => line.includes('video H.264')).length, 1, 'not logged again on close');
 });
+
+test('the participants line follows who is in the room as LiveKit sends changes', () => {
+    const p = require('@livekit/protocol');
+    const lines = [];
+    const log = (...args) => lines.push(args.join(' '));
+    log.error = log;
+    const source = new LiveKitSource(createCamera({ debug: true, log }));
+    const camera = new p.ParticipantInfo({ sid: 'PA_cam', identity: 'camera-x', state: p.ParticipantInfo_State.ACTIVE, isPublisher: true, tracks: [new p.TrackInfo({ type: p.TrackType.VIDEO, source: p.TrackSource.CAMERA, mimeType: 'video/H264' })] });
+    source._handleJoin(new p.JoinResponse({ participant: new p.ParticipantInfo({ sid: 'PA_me', identity: 'me-x' }), otherParticipants: [camera] }), () => {});
+
+    const app = new p.ParticipantInfo({ sid: 'PA_app', identity: 'app-x', state: p.ParticipantInfo_State.ACTIVE, tracks: [new p.TrackInfo({ type: p.TrackType.AUDIO, source: p.TrackSource.MICROPHONE, mimeType: 'audio/red' })] });
+    source._logParticipants([app]);
+    source._logParticipants([new p.ParticipantInfo({ sid: 'PA_me', identity: 'me-x', state: p.ParticipantInfo_State.ACTIVE })]);
+    source._logParticipants([new p.ParticipantInfo({ sid: 'PA_app', identity: '', state: p.ParticipantInfo_State.DISCONNECTED })]);
+
+    const updates = lines.filter((line) => line.includes('participants:'));
+    assert.equal(updates.length, 2);
+    assert.match(updates[0], /STANDARD\/ACTIVE publisher \[VIDEO\/CAMERA video\/H264\]; STANDARD\/ACTIVE \[AUDIO\/MICROPHONE audio\/red\]$/);
+    assert.match(updates[1], /participants: STANDARD\/ACTIVE publisher \[VIDEO\/CAMERA video\/H264\]$/);
+    assert.ok(!lines.join('\n').match(/camera-x|app-x|me-x|PA_/));
+    source.close();
+});

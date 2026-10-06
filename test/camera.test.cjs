@@ -263,3 +263,14 @@ test('a motion event is logged with its delay, the camera state and the clip Sim
     camera.simplisafe.emit('CAMERA_MOTION', event);
     assert.equal(tests, 1);
 });
+
+test('a camera status that is not a plain word is stored and logged as unknown', () => {
+    const camera = eventCamera();
+    camera.onCameraStatus({ uuid: camera.id, status: 'offline: https://x.simplisafe.com/v1/subscriptions/7654321', eventTimestamp: Date.now() });
+    camera.onCameraStatus({ uuid: camera.id, status: 'online', eventTimestamp: Date.now() });
+
+    assert.equal(camera.liveStatus, 'online');
+    assert.match(camera.lines[0], /^'Back Yard' is unknown, /);
+    assert.match(camera.lines[1], /^'Back Yard' is online \(was unknown\)/);
+    assert.ok(!camera.lines.join('\n').includes('7654321'));
+});

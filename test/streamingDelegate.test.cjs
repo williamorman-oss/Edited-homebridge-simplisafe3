@@ -764,3 +764,17 @@ test('audio timing compares the camera\'s Opus packets with what HomeKit asked f
     assert.equal(delegate.describeAudioTiming(packets, { sample_rate: 24, packet_time: 20 }),
         'camera sends 20 ms Opus packets, timestamps 960 apart (48 kHz clock); HomeKit asked for 24 kHz in 20 ms packets');
 });
+
+test('the clip test stops retrying once SimpliSafe rate limits the plugin', async () => {
+    const lines = [];
+    const log = (...args) => lines.push(args.join(' '));
+    log.error = log;
+    const delegate = new StreamingDelegate(createCameraStub({ log }));
+    delegate.simplisafe.isBlocked = true;
+    delegate.simplisafe.nextAttempt = Date.now() + 60000;
+
+    const event = { videoStartedBy: 'cam', video: { cam: { preroll: 5, _links: { 'playback/flv': { href: 'https://chronicle.simplisafe.com/clip.flv' } } } } };
+    await delegate.probeEventClip(event, Date.now());
+
+    assert.deepEqual(lines, ["Clip test for 'Garage Camera': stopped after 0 attempt(s), SimpliSafe is rate limiting the plugin"]);
+});

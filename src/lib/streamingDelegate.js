@@ -15,7 +15,7 @@ import SnapshotCache from './snapshotCache';
 import { fetchMjpegFrame } from './mjpeg';
 import { applyFfmpegOptions, flattenFfmpegArgs, redactFfmpegArgs } from './ffmpegArgs';
 import { eventClip, opusPacketDuration, simplisafeUrl, linkName } from './diagnosticLines';
-import { probeClip, httpGet, domainOf } from './clipProbe';
+import { probeClip, httpGet, domainOf, isSimpliSafeHost } from './clipProbe';
 
 const dnsLookup = promisify(dns.lookup);
 
@@ -48,7 +48,7 @@ const clipRetryInterval = 2000; // ms between attempts to read SimpliSafe's clip
 function describeFailure(result) {
     if (!result) return '';
     if (result.status && result.status !== 200) return `, last HTTP ${result.status}`;
-    if (result.error === 'no segments yet' || result.error === 'first segment not available') return `, last: ${result.error}`;
+    if (['no segments yet', 'first segment not available', 'bad redirect', 'bad response'].includes(result.error)) return `, last: ${result.error}`;
     if (result.error) return /timed out/.test(result.error) ? ', last request timed out' : ', last request failed';
     return ', nothing readable in what arrived';
 }
@@ -950,6 +950,15 @@ class StreamingDelegate {
         }
     }
 
+    // Stops the clip test's retries once SimpliSafe rate limits the plugin or refuses the login, logging why
+    motionTestRefused(name, attempts, last) {
+        const blocked = this.simplisafe.isBlocked && Date.now() < this.simplisafe.nextAttempt;
+        const refused = last && (last.status === 429 || ([401, 403].includes(last.status) && last.host && isSimpliSafeHost(last.host)));
+        if (!blocked && !refused) return false;
+        this.log(`Clip test for '${name}': stopped after ${attempts} attempt(s), ${blocked ? 'SimpliSafe is rate limiting the plugin' : `SimpliSafe refused it (HTTP ${last.status})`}`);
+        return true;
+    }
+
     // How soon SimpliSafe's own clip of the event, which starts a few seconds before it, can be read
     async probeEventClip(event, receivedAt) {
         const name = this.ss3Camera.name;
@@ -968,11 +977,18 @@ class StreamingDelegate {
         }
 
         const preroll = typeof clip.preroll === 'number' ? `starts ${clip.preroll}s before the event` : 'pre-roll unknown';
+        const deadline = receivedAt + motionTestTimeout;
         let attempts = 0;
         let last = null;
-        while (Date.now() - receivedAt < motionTestTimeout) {
+        while (Date.now() < deadline) {
+            if (this.motionTestRefused(name, attempts, last)) return;
             attempts++;
-            const result = await probeClip(url, kind, { token: this.ss3Camera.authManager.accessToken, ffmpegPath: this.ss3Camera.ffmpegPath });
+            let result;
+            try {
+                result = await probeClip(url, kind, { token: this.ss3Camera.authManager.accessToken, ffmpegPath: this.ss3Camera.ffmpegPath, deadline });
+            } catch {
+                result = { readable: false, error: 'bad response' };
+            }
             if (result.readable) {
                 this.log(`Clip test for '${name}': ${kind} clip (${preroll}) readable ${((Date.now() - receivedAt) / 1000).toFixed(1)}s after the event arrived, attempt ${attempts}; ${result.details}`);
                 return;
@@ -980,6 +996,7 @@ class StreamingDelegate {
             last = result;
             await new Promise(resolve => setTimeout(resolve, clipRetryInterval));
         }
+        if (this.motionTestRefused(name, attempts, last)) return;
         this.log(`Clip test for '${name}': ${kind} clip (${preroll}) not readable within ${motionTestTimeout / 1000}s, ${attempts} attempts${describeFailure(last)}`);
     }
 
@@ -991,12 +1008,14 @@ class StreamingDelegate {
         const url = link && simplisafeUrl(link.href);
         if (!url) return;
 
+        const deadline = receivedAt + motionTestTimeout;
         let attempts = 0;
         let last = null;
-        while (Date.now() - receivedAt < motionTestTimeout) {
+        while (Date.now() < deadline) {
+            if (this.motionTestRefused(name, attempts, last)) return;
             attempts++;
-            const result = await httpGet(url, { token: this.ss3Camera.authManager.accessToken, maxBytes: 5 * 1024 * 1024 });
-            const image = result.status === 200 && result.body && result.body[0] === 0xFF && result.body[1] === 0xD8 ? result.body : null;
+            const result = await httpGet(url, { token: this.ss3Camera.authManager.accessToken, maxBytes: 5 * 1024 * 1024, deadline });
+            const image = result.status === 200 && !result.truncated && result.body && result.body[0] === 0xFF && result.body[1] === 0xD8 ? result.body : null;
             if (image) {
                 this.log(`Clip test for '${name}': SimpliSafe's image of the event ready ${((Date.now() - receivedAt) / 1000).toFixed(1)}s after it arrived, attempt ${attempts}, ${Math.round(image.length / 1000)}kB from ${domainOf(result.host)}`);
                 return;
@@ -1004,6 +1023,7 @@ class StreamingDelegate {
             last = result;
             await new Promise(resolve => setTimeout(resolve, clipRetryInterval));
         }
+        if (this.motionTestRefused(name, attempts, last)) return;
         this.log(`Clip test for '${name}': SimpliSafe's image of the event not ready within ${motionTestTimeout / 1000}s, ${attempts} attempts${describeFailure(last)}`);
     }
 

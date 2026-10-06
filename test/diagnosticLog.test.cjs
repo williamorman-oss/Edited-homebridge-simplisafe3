@@ -179,3 +179,15 @@ test('removes the subscription number from LiveKit room names and API paths', ()
     assert.ok(!redacted.includes('1234567'), redacted);
     assert.ok(redacted.includes('719f3d450fdb48f5a3a1a2ccf125bfe8'), 'the camera uuid stays, it is needed to follow events');
 });
+
+test('account numbers that mix letters and digits are removed whole, plain words after "account" stay', () => {
+    const text = [
+        '{"account":"1234ABCD","sid":7654321}',
+        "{ account: 'abcdef12', userId: 4433221 }",
+        'accountNumber=9f8e7d6c',
+        'account: login',
+    ].map(redact).join('\n');
+
+    for (const secret of ['1234ABCD', 'ABCD', 'abcdef12', '9f8e7d6c', '7654321', '4433221']) assert.ok(!text.includes(secret), `${secret} must be removed`);
+    assert.ok(text.includes('account: login'));
+});

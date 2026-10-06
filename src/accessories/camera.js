@@ -204,14 +204,15 @@ class SS3Camera extends SimpliSafe3Accessory {
 
     onCameraStatus(data) {
         if (!data || data.uuid !== this.id || typeof data.status !== 'string') return;
-        if (data.status === this.liveStatus) return;
+        // checked once here, every log line that mentions it prints this value
+        const status = /^[a-z_]{1,24}$/i.test(data.status) ? data.status : 'unknown';
+        if (status === this.liveStatus) return;
 
         const previous = this.liveStatus;
-        this.liveStatus = data.status;
+        this.liveStatus = status;
         this.liveStatusAt = Date.now();
         if (this.debug) {
             const delay = this.eventDelay(data);
-            const status = /^[a-z_]+$/i.test(data.status) ? data.status : '(unknown)';
             this.log(`'${this.name}' is ${status}${previous ? ` (was ${previous})` : ''}${delay === null ? '' : `, reported ${delay.toFixed(1)}s after the camera's timestamp`}`);
         }
     }

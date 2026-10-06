@@ -2,6 +2,7 @@ import { EventEmitter } from 'events';
 import WebSocket from 'ws';
 import { RTCPeerConnection, RTCRtpCodecParameters } from 'werift';
 import {
+    ParticipantInfo_State,
     SignalRequest,
     SignalResponse,
     SessionDescription,
@@ -41,6 +42,10 @@ class LiveKitSource extends EventEmitter {
         this.lastKeyframeTimestamp = null;
         this.loggedSignals = new Set();
         this.lastParticipants = null;
+        // who else is in the room, keyed by identity, which is never logged. LiveKit sends changes only
+        this.room = new Map();
+        this.sidToIdentity = new Map();
+        this.selfIdentity = null;
     }
 
     _sessionEnded(reason) {
@@ -180,11 +185,17 @@ class LiveKitSource extends EventEmitter {
 
     _handleJoin(join, send) {
         if (this.closed) return;
+        this.selfIdentity = join.participant && join.participant.identity;
+        for (const info of join.otherParticipants || []) {
+            this.room.set(info.identity, info);
+            this.sidToIdentity.set(info.sid, info.identity);
+        }
+
         // the room name ends in the subscription number, so it is not logged
         if (this.debug) {
             this.log(`LiveKit: joined the room for ${this.ss3Camera.name}`);
             this.log(`LiveKit: ${this.ss3Camera.name} room: ${liveKitJoin(join)}`);
-            this.lastParticipants = participants(join.otherParticipants);
+            this.lastParticipants = participants([...this.room.values()]);
         }
 
         this.pc = new RTCPeerConnection({
@@ -253,8 +264,20 @@ class LiveKitSource extends EventEmitter {
 
     // Who is in the room changed, e.g. the SimpliSafe app started talking through the camera
     _logParticipants(list) {
+        for (const info of list || []) {
+            // older servers leave the identity out when someone leaves
+            const identity = info.identity || this.sidToIdentity.get(info.sid) || info.sid;
+            if (!identity || identity === this.selfIdentity) continue;
+            if (info.state === ParticipantInfo_State.DISCONNECTED) {
+                this.room.delete(identity);
+            } else {
+                this.room.set(identity, info);
+                if (info.sid) this.sidToIdentity.set(info.sid, identity);
+            }
+        }
+
         if (!this.debug) return;
-        const summary = participants(list);
+        const summary = participants([...this.room.values()]);
         if (summary === this.lastParticipants) return;
         this.lastParticipants = summary;
         this.log(`LiveKit: ${this.ss3Camera.name} participants: ${summary}`);

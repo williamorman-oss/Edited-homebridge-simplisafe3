@@ -469,7 +469,12 @@ class SimpliSafe3 extends EventEmitter {
 
             const details = response.data && response.data.liveKitDetails;
             if (!details || !details.liveKitURL || !details.userToken) {
-                throw new Error(`Unexpected live-view response: ${JSON.stringify(response.data)}`);
+                // only field names: the reply can hold signed links and credentials
+                const data = response.data && typeof response.data === 'object' ? response.data : {};
+                const fields = object => Object.keys(object).filter(key => /^[A-Za-z_]+$/.test(key)).join(',') || 'none';
+                const inner = details && typeof details === 'object' ? ` (liveKitDetails has ${fields(details)})` : '';
+                const status = typeof data.cameraStatus === 'string' && /^[a-z_]{1,24}$/i.test(data.cameraStatus) ? `, cameraStatus ${data.cameraStatus}` : '';
+                throw new Error(`Unexpected live-view response: fields ${fields(data)}${inner}${status}`);
             }
 
             return { ...details, cameraStatus: response.data.cameraStatus };
