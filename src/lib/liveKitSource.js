@@ -157,7 +157,8 @@ class LiveKitSource extends EventEmitter {
 
     _handleJoin(join, send) {
         if (this.closed) return;
-        if (this.debug) this.log(`LiveKit: joined room ${join.room && join.room.name}`);
+        // the room name ends in the subscription number, so it is not logged
+        if (this.debug) this.log(`LiveKit: joined the room for ${this.ss3Camera.name}`);
 
         this.pc = new RTCPeerConnection({
             iceServers: (join.iceServers || []).map(server => ({

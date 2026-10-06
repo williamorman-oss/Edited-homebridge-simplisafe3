@@ -167,3 +167,15 @@ test('the once-a-minute socket heartbeat is kept only every 15 minutes', () => {
 
     assert.match(diagnostics.contents(), /--- 3 log lines ---/);
 });
+
+test('removes the subscription number from LiveKit room names and API paths', () => {
+    const lines = [
+        'LiveKit: joined room 719f3d450fdb48f5a3a1a2ccf125bfe8_1234567',
+        'Request failed: GET /v2/cameras/719f3d450fdb48f5a3a1a2ccf125bfe8/1234567/live-view',
+        'url: /ss3/subscriptions/1234567/sensors?forceUpdate=false',
+    ];
+
+    const redacted = lines.map(redact).join('\n');
+    assert.ok(!redacted.includes('1234567'), redacted);
+    assert.ok(redacted.includes('719f3d450fdb48f5a3a1a2ccf125bfe8'), 'the camera uuid stays, it is needed to follow events');
+});

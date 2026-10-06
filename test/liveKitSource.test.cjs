@@ -172,3 +172,14 @@ test('closing cancels a follow-up keyframe request', async () => {
 
     assert.equal(plis, 1);
 });
+
+test('joining logs the camera name, not the room name that ends in the subscription number', () => {
+    const lines = [];
+    const log = (...args) => lines.push(args.join(' '));
+    log.error = log;
+    const source = new LiveKitSource(createCamera({ debug: true, log }));
+    source._handleJoin({ iceServers: [], room: { name: '719f3d450fdb48f5a3a1a2ccf125bfe8_1234567' } }, () => {});
+
+    assert.deepEqual(lines, ['LiveKit: joined the room for Back Yard']);
+    source.close();
+});

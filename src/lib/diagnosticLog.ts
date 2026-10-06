@@ -43,6 +43,10 @@ export function redact(text: string): string {
         .replace(/\b((?:access|refresh|user|id)_?token|token|code_?verifier|password|secret)\b(["']?\s*[:=]\s*["']?)[^"'&\s,}]+/gi, '$1$2[REMOVED]')
         .replace(/\b(wifiSsid|ssid)\b(["']?\s*:\s*["'])[^"']*/gi, '$1$2[REMOVED]')
         .replace(/\b(uid|sid|userId|accountNumber|subscriptionId|account(?:\s+number)?)\b(["']?\s*[:=]\s*["']?)\d+/gi, '$1$2[ID REMOVED]')
+        // the subscription number inside LiveKit room names and API paths
+        .replace(/\b([0-9a-f]{32})_\d+\b/gi, '$1_[ID REMOVED]')
+        .replace(/(subscriptions\/)\d+/gi, '$1[ID REMOVED]')
+        .replace(/(\/cameras\/[0-9a-f]{32}\/)\d+/gi, '$1[ID REMOVED]')
         .replace(/[\w.+-]+@[\w-]+(?:\.[\w-]+)+/g, '[EMAIL REMOVED]')
         .replace(/\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b/g, '[MAC REMOVED]');
 }
