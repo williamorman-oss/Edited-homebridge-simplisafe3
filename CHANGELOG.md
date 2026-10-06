@@ -4,7 +4,7 @@ All notable changes are documented here.
 ## 1.12.0-beta.5, homebridge-simplisafe3-edited (2026-10-06)
 Install, or update an earlier beta, next to the original plugin (see the README):
 ```
-INSTALL_COMMAND_PENDING
+npm install --prefix /var/lib/homebridge https://github.com/williamorman-oss/Edited-homebridge-simplisafe3/raw/ec6223e403e7c161a4c686a94e67f4513b527428/releases/homebridge-simplisafe3-edited-1.12.0-beta.5.tgz
 ```
 
 - Snapshots and live views of a LiveKit camera share one connection. A live view opened while a battery camera is being woken for a snapshot joins that wake-up instead of waking it again, and a second iPhone or iPad joins the first. The connection closes as soon as nothing uses it, so sharing never keeps a camera awake
