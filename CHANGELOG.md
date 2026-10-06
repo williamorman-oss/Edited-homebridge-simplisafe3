@@ -4,7 +4,7 @@ All notable changes are documented here.
 ## 1.12.0-beta.6, homebridge-simplisafe3-edited (2026-10-06)
 Install, or update an earlier beta, next to the original plugin (see the README):
 ```
-INSTALL_COMMAND_PENDING
+npm install --prefix /var/lib/homebridge https://github.com/williamorman-oss/Edited-homebridge-simplisafe3/raw/2b4fac031e94a70498d66e22cd60c356932bacbe/releases/homebridge-simplisafe3-edited-1.12.0-beta.6.tgz
 ```
 
 Diagnostics for HomeKit recording and two-way audio. Nothing changes in HomeKit.
