@@ -59,6 +59,12 @@
             "default": 10,
             "minimum": 1
           },
+          "eventImages": {
+            "title": " Use SimpliSafe's Event Images for Notifications",
+            "description": "For Outdoor Cameras, a motion or doorbell notification shows SimpliSafe's own image of the event when it is ready within 3 seconds (usually under 1), instead of waking the camera for a new one.",
+            "type": "boolean",
+            "default": true
+          },
           "motionTest": {
             "title": " Motion Test (temporary)",
             "description": "For a test session only: after each motion or doorbell event, measure how soon the camera's video arrives and how soon SimpliSafe's own clip of the event can be read, and write the results to the log. Each event wakes a battery camera (at most once a minute per camera). Turn on Debug as well, and turn this off again afterwards.",
@@ -131,6 +137,7 @@
 			},
       "items": [
         "cameraOptions.batterySnapshotMinutes",
+        "cameraOptions.eventImages",
         "cameraOptions.motionTest",
         "cameraOptions.enableHwaccelRpi",
         "cameraOptions.ffmpegPath",

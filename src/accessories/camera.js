@@ -196,6 +196,9 @@ class SS3Camera extends SimpliSafe3Accessory {
     describeEvent(data) {
         const delay = this.eventDelay(data);
         const parts = [delay === null ? 'with no timestamp' : `about ${delay.toFixed(1)}s after SimpliSafe's timestamp`];
+        // when the camera itself was triggered, if SimpliSafe says
+        const trigger = eventTime({ eventTimestamp: data.internal && data.internal.triggerTimestamp });
+        if (trigger !== null) parts.push(`${((Date.now() - trigger) / 1000).toFixed(1)}s after the camera was triggered`);
         if (this.liveStatus) parts.push(`camera ${this.liveStatus} for ${Math.round((Date.now() - this.liveStatusAt) / 1000)}s`);
         const clip = eventClip(data);
         if (clip) parts.push(`SimpliSafe clip starts ${typeof clip.preroll === 'number' ? clip.preroll : '?'}s before it`);
@@ -233,6 +236,7 @@ class SS3Camera extends SimpliSafe3Accessory {
             const receivedAt = Date.now();
             this.lastEventAt = receivedAt;
             if (this.debug) this.log(`Motion: '${this.name}' event arrived ${this.describeEvent(data)}`);
+            if (this.streamingDelegate && this.streamingDelegate.noteEvent) this.streamingDelegate.noteEvent(data, receivedAt);
             this.runMotionTest(data, receivedAt);
             this.accessory.getService(this.api.hap.Service.MotionSensor).updateCharacteristic(this.api.hap.Characteristic.MotionDetected, true);
             this.motionIsTriggered = true;
@@ -250,6 +254,7 @@ class SS3Camera extends SimpliSafe3Accessory {
             this.lastEventAt = receivedAt;
             const doorbell = this.accessory.getService(this.api.hap.Service.Doorbell);
             if (this.debug) this.log(`Doorbell: '${this.name}' pressed, event arrived ${this.describeEvent(data)}${doorbell ? ', notifying HomeKit' : ', but it has no doorbell in HomeKit'}`);
+            if (this.streamingDelegate && this.streamingDelegate.noteEvent) this.streamingDelegate.noteEvent(data, receivedAt);
             if (doorbell) doorbell.getCharacteristic(this.api.hap.Characteristic.ProgrammableSwitchEvent).setValue(0);
             this.runMotionTest(data, receivedAt);
         });

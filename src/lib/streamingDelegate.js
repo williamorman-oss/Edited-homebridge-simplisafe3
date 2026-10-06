@@ -16,6 +16,7 @@ import { fetchMjpegFrame } from './mjpeg';
 import { applyFfmpegOptions, flattenFfmpegArgs, redactFfmpegArgs } from './ffmpegArgs';
 import { eventClip, opusPacketDuration, simplisafeUrl, linkName } from './diagnosticLines';
 import { probeClip, httpGet, domainOf, isSimpliSafeHost } from './clipProbe';
+import { OpusRepacker } from './opus';
 
 const dnsLookup = promisify(dns.lookup);
 
@@ -27,6 +28,12 @@ const keyframeTimeout = 15000; // ms, waiting for a keyframe to build a snapshot
 // Snapshots are served from a cache and refreshed in the background, see SnapshotCache
 const snapshotBudget = 5000; // ms to wait when there is no image yet, inside HomeKit's 8s 'slow' warning
 const freshSnapshotBudget = 7000; // ms to wait for a new image for a doorbell or motion notification
+// SimpliSafe's own still of a motion event, for cameras it records itself (KVS, the Outdoor Cameras). In the
+// logs it was ready within a second of the event reaching the plugin, while the camera took 2-7s to send video
+const eventImageWait = 3000; // ms to keep trying for it
+const eventImageHeadStart = 1500; // ms before the camera is asked as well
+const eventImageMaxAge = 15000; // ms after the event that its image is still the one to show
+const eventImageMinWidth = 640; // px, a smaller image falls back to the camera's
 const legacySnapshotRefreshAge = 10000; // ms, the Home app asks every 8-10s per visible camera
 const poweredSnapshotRefreshAge = 60000; // ms, each LiveKit refresh joins the camera's room
 const defaultBatterySnapshotMinutes = 10; // each refresh wakes a battery camera
@@ -43,6 +50,23 @@ const alarmStateTimeout = 3000; // ms to wait for the alarm state when it is not
 const motionTestCooldown = 60000; // ms per camera, each test wakes a battery camera
 const motionTestTimeout = 30000; // ms to wait for the camera's video or SimpliSafe's clip
 const clipRetryInterval = 2000; // ms between attempts to read SimpliSafe's clip of the event
+
+// Width and height from a JPEG's frame header, or null if it is not a whole JPEG
+function jpegSize(image) {
+    if (image.length < 4 || image[0] !== 0xFF || image[1] !== 0xD8) return null;
+    if (image[image.length - 2] !== 0xFF || image[image.length - 1] !== 0xD9) return null;
+    for (let offset = 2; offset + 9 < image.length;) {
+        if (image[offset] !== 0xFF) return null;
+        const marker = image[offset + 1];
+        const length = image.readUInt16BE(offset + 2);
+        // start of frame, baseline or progressive (not DHT C4, JPG C8 or DAC CC)
+        if (marker >= 0xC0 && marker <= 0xCF && ![0xC4, 0xC8, 0xCC].includes(marker)) {
+            return { height: image.readUInt16BE(offset + 5), width: image.readUInt16BE(offset + 7) };
+        }
+        offset += 2 + length;
+    }
+    return null;
+}
 
 // Why the last attempt to read a clip failed, without the error text, which can hold the link
 function describeFailure(result) {
@@ -81,13 +105,15 @@ class StreamingDelegate {
         this.ongoingSessions = {};
         this.liveKitSessions = {};
         this.liveKitShared = null;
+        this.eventImage = null;
+        this.httpGet = httpGet;
         this.snapshotBusy = false;
         this.snapshotWidth = 1280;
 
         const liveKit = this.ss3Camera.getStreamProvider() === 'livekit';
         this.snapshots = new SnapshotCache({
             name: ss3Camera.name,
-            fetch: () => liveKit ? this.warmSnapshot() : this.fetchLegacySnapshot(),
+            fetch: () => this.fetchSnapshot(liveKit),
             refreshAge: () => this.snapshotRefreshAge(),
             budget: snapshotBudget,
             timeout: (liveKit ? liveKitSnapshotTimeout + keyframeTimeout : legacySnapshotTimeout) + 5000,
@@ -282,6 +308,68 @@ class StreamingDelegate {
             if (!this.serverIpAddress) throw new Error('Could not resolve hostname for media.simplisafe.com');
         }
         return this.serverIpAddress;
+    }
+
+    // SimpliSafe's image of a recent event if it comes quickly, otherwise the camera's. The camera is only
+    // asked once the event image has had a head start, and whichever image arrives first is used
+    async fetchSnapshot(liveKit) {
+        const fromCamera = () => liveKit ? this.warmSnapshot() : this.fetchLegacySnapshot();
+        const eventImage = this.fetchEventImage();
+        let headStartID;
+        const late = new Promise(resolve => {
+            headStartID = setTimeout(() => resolve('late'), eventImageHeadStart);
+        });
+        const first = await Promise.race([eventImage, late]);
+        clearTimeout(headStartID);
+        if (first && first !== 'late') return first;
+        if (first === null) return fromCamera();
+
+        const camera = fromCamera();
+        camera.catch(() => {}); // when the event image wins, the camera's result is not needed
+        return new Promise((resolve, reject) => {
+            eventImage.then(image => { if (image) resolve(image); });
+            camera.then(resolve, err => eventImage.then(image => (image ? resolve(image) : reject(err))));
+        });
+    }
+
+    // Remembers where SimpliSafe will put its still of a motion or doorbell event, see fetchEventImage
+    noteEvent(event, receivedAt) {
+        if (this.cameraOptions && this.cameraOptions.eventImages === false) return;
+        const clip = eventClip(event);
+        if (!clip || clip.recordingType !== 'KVS') return; // other clips' images took 25s or more
+        const link = clip._links && clip._links['snapshot/jpg'];
+        if (!link || typeof link.href !== 'string') return;
+        const url = simplisafeUrl(link.href.replace('{&width}', `&width=${this.snapshotWidth}`));
+        if (url) this.eventImage = { url, at: receivedAt, tried: false };
+    }
+
+    // SimpliSafe's still of the latest event, if it is recent and arrives in time. Saves waking the camera,
+    // and shows the moment of the event rather than a few seconds later
+    async fetchEventImage() {
+        const event = this.eventImage;
+        if (!event || event.tried || Date.now() - event.at > eventImageMaxAge) return null;
+        event.tried = true;
+
+        const name = this.ss3Camera.name;
+        const deadline = Date.now() + eventImageWait;
+        while (Date.now() < deadline) {
+            if (this.simplisafe.isBlocked && Date.now() < this.simplisafe.nextAttempt) return null;
+            const result = await this.httpGet(event.url, { token: this.ss3Camera.authManager.accessToken, maxBytes: 4 * 1024 * 1024, deadline });
+            const body = result.status === 200 && !result.truncated ? result.body : null;
+            const size = body && jpegSize(body);
+            if (size) {
+                if (size.width < eventImageMinWidth) {
+                    if (this.ss3Camera.debug) this.log(`SimpliSafe's image of the event for '${name}' is only ${size.width}x${size.height}, using the camera's`);
+                    return null;
+                }
+                if (this.ss3Camera.debug) this.log(`Using SimpliSafe's image of the event for '${name}' (${size.width}x${size.height}), ready ${((Date.now() - event.at) / 1000).toFixed(1)}s after the event`);
+                return body;
+            }
+            if ([401, 403, 429].includes(result.status)) break;
+            await new Promise(resolve => setTimeout(resolve, 500));
+        }
+        if (this.ss3Camera.debug) this.log(`SimpliSafe's image of the event for '${name}' was not ready in ${eventImageWait / 1000}s, using the camera's`);
+        return null;
     }
 
     async fetchLegacySnapshot() {
@@ -845,6 +933,8 @@ class StreamingDelegate {
 
             let audioSrtp = this.createSrtpSession(sessionInfo.audio_srtp);
             let audioTiming = this.ss3Camera.debug ? [] : null;
+            // HomeKit only plays packets of the length it asked for, timed at the rate it asked for
+            let repacker = new OpusRepacker({ packetTime: request.audio.packet_time, sampleRate: request.audio.sample_rate });
             listen('audio', rtp => {
                 if (audioTiming) {
                     audioTiming.push(rtp);
@@ -853,7 +943,10 @@ class StreamingDelegate {
                         audioTiming = null;
                     }
                 }
-                this.forwardRtp(rtp, audioSrtp, socket, audioPayloadType, sessionInfo.audio_ssrc, sessionInfo.audio_port, sessionInfo.address);
+                for (let packet of repacker.push(rtp)) {
+                    let header = { ...rtp.header, sequenceNumber: packet.sequenceNumber, timestamp: packet.timestamp, marker: false };
+                    this.forwardRtp({ header, payload: packet.payload }, audioSrtp, socket, audioPayloadType, sessionInfo.audio_ssrc, sessionInfo.audio_port, sessionInfo.address);
+                }
             });
             if (this.ss3Camera.debug) this.log(`Audio: forwarding Opus to ${sessionInfo.address}:${sessionInfo.audio_port}`);
         };
@@ -899,7 +992,7 @@ class StreamingDelegate {
         const step = steps.length ? steps[Math.floor(steps.length / 2)] : null;
         const duration = opusPacketDuration(packets[packets.length - 1].payload);
         const clock = step && duration ? `${Math.round(step / duration)} kHz clock` : 'clock unknown';
-        return `camera sends ${duration === null ? '?' : duration} ms Opus packets, timestamps ${step === null ? '?' : step} apart (${clock}); HomeKit asked for ${requested ? requested.sample_rate : '?'} kHz in ${requested ? requested.packet_time : '?'} ms packets`;
+        return `camera sends ${duration === null ? '?' : duration} ms Opus packets, timestamps ${step === null ? '?' : step} apart (${clock}); HomeKit asked for ${requested ? requested.sample_rate : '?'} kHz in ${requested ? requested.packet_time : '?'} ms packets, re-cut to match`;
     }
 
     // The motionTest option. After a motion or doorbell event, measures how soon the camera's video arrives

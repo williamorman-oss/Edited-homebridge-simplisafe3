@@ -762,7 +762,7 @@ test('audio timing compares the camera\'s Opus packets with what HomeKit asked f
     const packets = Array.from({ length: 10 }, (_, i) => ({ header: { timestamp: (4294966000 + i * 960) >>> 0 }, payload: Buffer.from([0xfc, 0]) }));
 
     assert.equal(delegate.describeAudioTiming(packets, { sample_rate: 24, packet_time: 20 }),
-        'camera sends 20 ms Opus packets, timestamps 960 apart (48 kHz clock); HomeKit asked for 24 kHz in 20 ms packets');
+        'camera sends 20 ms Opus packets, timestamps 960 apart (48 kHz clock); HomeKit asked for 24 kHz in 20 ms packets, re-cut to match');
 });
 
 test('the clip test stops retrying once SimpliSafe rate limits the plugin', async () => {
@@ -777,4 +777,123 @@ test('the clip test stops retrying once SimpliSafe rate limits the plugin', asyn
     await delegate.probeEventClip(event, Date.now());
 
     assert.deepEqual(lines, ["Clip test for 'Garage Camera': stopped after 0 attempt(s), SimpliSafe is rate limiting the plugin"]);
+});
+
+test('a live view re-cuts the camera\'s 100 ms Opus packets into the 20 ms packets HomeKit plays', async () => {
+    const { opusPacket, opusFrames } = require('../dist/lib/opus');
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
+    const created = useFakeLiveKit(delegate);
+    const sent = [];
+    delegate.forwardRtp = (rtp, srtp, socket, payloadType) => sent.push({ payloadType, header: rtp.header, payload: rtp.payload });
+
+    delegate.prepareStream(liveKitStreamRequest('phone'), () => {});
+    await delegate.handleStreamRequest({
+        sessionID: 'phone', type: 'start',
+        video: { width: 1280, height: 720, fps: 30, max_bit_rate: 299 },
+        audio: { codec: 'OPUS', sample_rate: 24, packet_time: 20 },
+    }, () => {});
+    const source = created[0];
+    source.streaming = true;
+    source.connected();
+    await tick();
+
+    const frame = Buffer.from([0xaa, 0xbb]);
+    source.emit('audio', { header: { timestamp: 96000, sequenceNumber: 7, ssrc: 1, payloadType: 111 }, payload: opusPacket(0xf8, [frame, frame, frame, frame, frame]) });
+    source.emit('audio', { header: { timestamp: 100800, sequenceNumber: 8, ssrc: 1, payloadType: 111 }, payload: opusPacket(0xf8, [frame, frame, frame, frame, frame]) });
+
+    const audio = sent.filter((packet) => packet.payloadType === 110);
+    assert.equal(audio.length, 10);
+    assert.deepEqual(audio.map((packet) => packet.header.timestamp), [0, 480, 960, 1440, 1920, 2400, 2880, 3360, 3840, 4320]);
+    for (const packet of audio) assert.deepEqual(opusFrames(packet.payload).frames, [frame]);
+    await delegate.handleStreamRequest({ sessionID: 'phone', type: 'stop' }, () => {});
+});
+
+// A minimal JPEG of the given size: start, frame header, end
+function jpegOf(width, height) {
+    const sof = Buffer.from([0xFF, 0xC0, 0, 17, 8, height >> 8, height & 0xff, width >> 8, width & 0xff, 3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1]);
+    return Buffer.concat([Buffer.from([0xFF, 0xD8]), sof, Buffer.from([0xFF, 0xD9])]);
+}
+
+function kvsEvent(href = 'https://chronicle.us-east-1.prd.cam.simplisafe.com/v1/x/snapshot?t=1{&width}') {
+    return { videoStartedBy: 'cam', video: { cam: { recordingType: 'KVS', preroll: 12, _links: { 'snapshot/jpg': { href } } } } };
+}
+
+test('a motion notification uses SimpliSafe\'s image of the event rather than waking the camera', async () => {
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
+    let woke = 0;
+    delegate.warmSnapshot = async () => { woke++; return Buffer.from('camera'); };
+    const requested = [];
+    delegate.httpGet = async (url, options) => { requested.push({ url, token: options.token }); return { status: 200, body: jpegOf(1280, 720), host: 'chronicle.us-east-1.prd.cam.simplisafe.com' }; };
+
+    delegate.noteEvent(kvsEvent(), Date.now());
+    const image = await delegate.fetchSnapshot(true);
+
+    assert.equal(woke, 0);
+    assert.ok(image.equals(jpegOf(1280, 720)));
+    assert.deepEqual(requested, [{ url: 'https://chronicle.us-east-1.prd.cam.simplisafe.com/v1/x/snapshot?t=1&width=1280', token: 'token-123' }]);
+
+    assert.equal((await delegate.fetchSnapshot(true)).toString(), 'camera', 'an event\'s image is used once, later refreshes ask the camera');
+});
+
+test('a small, late or missing event image falls back to the camera', async () => {
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
+    delegate.warmSnapshot = async () => Buffer.from('camera');
+
+    delegate.httpGet = async () => ({ status: 200, body: jpegOf(320, 180) });
+    delegate.noteEvent(kvsEvent(), Date.now());
+    assert.equal((await delegate.fetchSnapshot(true)).toString(), 'camera', 'too small');
+
+    let calls = 0;
+    delegate.httpGet = async () => { calls++; return calls < 3 ? { status: 404 } : { status: 200, body: jpegOf(1280, 720) }; };
+    delegate.noteEvent(kvsEvent(), Date.now());
+    assert.ok((await delegate.fetchSnapshot(true)).equals(jpegOf(1280, 720)), 'ready on the third try, inside the wait');
+
+    delegate.httpGet = async () => ({ status: 403 });
+    delegate.noteEvent(kvsEvent(), Date.now());
+    assert.equal((await delegate.fetchSnapshot(true)).toString(), 'camera', 'refused');
+
+    delegate.httpGet = async () => assert.fail('an old event is not fetched');
+    delegate.noteEvent(kvsEvent(), Date.now() - 20000);
+    assert.equal((await delegate.fetchSnapshot(true)).toString(), 'camera');
+});
+
+test('only KVS clips on simplisafe.com are used, the Doorbell Pro\'s took 25s or more', async () => {
+    const delegate = new StreamingDelegate(createCameraStub());
+    delegate.fetchLegacySnapshot = async () => Buffer.from('mjpeg');
+    delegate.httpGet = async () => assert.fail('not fetched');
+
+    delegate.noteEvent({ videoStartedBy: 'cam', video: { cam: { recordingType: 'TEP', _links: { 'snapshot/jpg': { href: 'https://media.simplisafe.com/x' } } } } }, Date.now());
+    assert.equal(delegate.eventImage, null);
+    delegate.noteEvent(kvsEvent('https://evil.example/snapshot'), Date.now());
+    assert.equal(delegate.eventImage, null);
+    assert.equal((await delegate.fetchSnapshot(false)).toString(), 'mjpeg');
+});
+
+test('eventImages false keeps asking the camera', async () => {
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit', cameraOptions: { eventImages: false } }));
+    delegate.noteEvent(kvsEvent(), Date.now());
+    assert.equal(delegate.eventImage, null);
+});
+
+test('a slow event image gets a head start, then the camera is asked too and the first image wins', async () => {
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
+    let woke = 0;
+    delegate.warmSnapshot = () => { woke++; return new Promise((resolve) => setTimeout(() => resolve(Buffer.from('camera')), 300)); };
+
+    // the image is ready after 2s: past the head start, but before the camera
+    let calls = 0;
+    delegate.httpGet = async () => (++calls < 5 ? { status: 404 } : { status: 200, body: jpegOf(1280, 720) });
+    delegate.noteEvent(kvsEvent(), Date.now());
+    const started = Date.now();
+    const image = await delegate.fetchSnapshot(true);
+    assert.equal(woke, 1, 'the camera was asked after the head start');
+    assert.equal(image.toString(), 'camera', 'and its image came first');
+    assert.ok(Date.now() - started < 2200);
+
+    // an event image that arrives before the camera's wins
+    delegate.warmSnapshot = () => { woke++; return new Promise((resolve) => setTimeout(() => resolve(Buffer.from('camera')), 3000)); };
+    calls = 0;
+    delegate.httpGet = async () => (++calls < 4 ? { status: 404 } : { status: 200, body: jpegOf(1280, 720) });
+    delegate.noteEvent(kvsEvent(), Date.now());
+    assert.ok((await delegate.fetchSnapshot(true)).equals(jpegOf(1280, 720)));
 });

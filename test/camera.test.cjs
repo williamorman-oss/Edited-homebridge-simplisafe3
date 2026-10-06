@@ -274,3 +274,10 @@ test('a camera status that is not a plain word is stored and logged as unknown',
     assert.match(camera.lines[1], /^'Back Yard' is online \(was unknown\)/);
     assert.ok(!camera.lines.join('\n').includes('7654321'));
 });
+
+test('when SimpliSafe says the camera was triggered, the motion line says how long before', () => {
+    const camera = eventCamera();
+    const now = Date.now();
+    const line = camera.describeEvent({ eventTimestamp: Math.floor(now / 1000) - 4, internal: { triggerTimestamp: now - 9000 } });
+    assert.match(line, /^about \d+\.\ds after SimpliSafe's timestamp, 9\.\ds after the camera was triggered$/);
+});
