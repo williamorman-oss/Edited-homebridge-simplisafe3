@@ -422,3 +422,23 @@ test('a failed ffmpeg start answers HomeKit exactly once', async () => {
     assert.equal(calls.length, 1);
     assert.ok(calls[0][0] instanceof Error);
 });
+
+test('stream requests are logged in one line, without the stream keys', async () => {
+    const lines = [];
+    const log = (...args) => lines.push(args.map(String).join(' '));
+    log.error = log;
+    const delegate = new StreamingDelegate(createCameraStub({ debug: true, log, getStreamProvider: () => 'legacy' }));
+
+    delegate.prepareStream({
+        targetAddress: '192.168.1.5',
+        sessionID: 'session-1',
+        video: { port: 5010, srtp_key: Buffer.from('1234567890123456'), srtp_salt: Buffer.from('12345678901234') },
+        audio: { port: 5011, srtp_key: Buffer.from('abcdefghijklmnop'), srtp_salt: Buffer.from('abcdefghijklmn') },
+    }, () => {});
+    await delegate.handleStreamRequest({ sessionID: 'session-2', type: 'stop' }, () => {});
+
+    assert.ok(lines.some((line) => line === "Prepare stream for 'Garage Camera' to 192.168.1.5"));
+    assert.ok(lines.some((line) => line === "Stream stop for 'Garage Camera'"));
+    assert.ok(!lines.join('\n').includes('srtp'));
+    assert.ok(!lines.join('\n').includes('1234567890'));
+});

@@ -23,7 +23,11 @@ const defaultMaxLines = 800;
 const defaultMaxBytes = 200 * 1024;
 const defaultFlushDelay = 10000; // ms, at most one write every 10s while the plugin is logging
 const maxLineLength = 2000; // e.g. the camera JSON logged at discovery is ~8 kB
-const progressInterval = 10000; // ms between kept ffmpeg 'frame=' progress lines, it prints two a second
+// Lines that repeat without saying anything new, only one per interval is kept
+const thinned = [
+    { pattern: /^\s*frame=\s*\d+/, interval: 10000 }, // ffmpeg progress while streaming, twice a second
+    { pattern: /^SSAPI socket `heartbeat`$/, interval: 15 * 60000 } // once a minute
+];
 const maxReadBytes = 512 * 1024;
 const levels = ['info', 'warn', 'error', 'debug', 'success', 'log'];
 
@@ -32,6 +36,8 @@ const levels = ['info', 'warn', 'error', 'debug', 'success', 'log'];
 export function redact(text: string): string {
     return text
         .replace(/(Bearer\s+)\S+/gi, '$1[REMOVED]')
+        .replace(/(srtp_(?:key|salt)['"]?\s*:\s*)<Buffer[^>]*>/gi, '$1[REMOVED]')
+        .replace(/(-srtp_out_params\s+)\S+/g, '$1[REMOVED]')
         .replace(/eyJ[\w-]+\.[\w-]+\.[\w-]+/g, '[TOKEN REMOVED]')
         .replace(/sk-ant-[\w-]+/g, '[TOKEN REMOVED]')
         .replace(/\b((?:access|refresh|user|id)_?token|token|code_?verifier|password|secret)\b(["']?\s*[:=]\s*["']?)[^"'&\s,}]+/gi, '$1$2[REMOVED]')
@@ -47,7 +53,7 @@ class DiagnosticLog {
     private lines: string[] = [];
     private bytes = 0;
     private dropped = 0;
-    private lastProgressAt = -Infinity;
+    private lastThinnedAt = thinned.map(() => -Infinity);
     private timer?: ReturnType<typeof setTimeout>;
     private options: DiagnosticLogOptions;
     private now: () => number;
@@ -80,10 +86,10 @@ class DiagnosticLog {
         let text = redact(format(...args)).trimEnd();
         if (!text) return;
 
-        // ffmpeg's debug output prints a progress line twice a second while streaming
-        if (/^\s*frame=\s*\d+/.test(text)) {
-            if (this.now() - this.lastProgressAt < progressInterval) return;
-            this.lastProgressAt = this.now();
+        const noisy = thinned.findIndex(({ pattern }) => pattern.test(text));
+        if (noisy >= 0) {
+            if (this.now() - this.lastThinnedAt[noisy] < thinned[noisy].interval) return;
+            this.lastThinnedAt[noisy] = this.now();
         }
 
         if (text.length > maxLineLength) text = `${text.slice(0, maxLineLength)}... (${text.length - maxLineLength} characters cut)`;

@@ -195,3 +195,11 @@ test('the battery service reports level, low battery and charging', () => {
     assert.deepEqual(updates, { BatteryLevel: 100, StatusLowBattery: 0, ChargingState: 1 });
     assert.equal(camera.cameraDetails.cameraStatus.batteryPercentage, 100);
 });
+
+test('a sleeping battery camera reads as asleep in the logs, not just offline', () => {
+    const camera = (details) => Object.assign(Object.create(SS3Camera.prototype), { name: 'Back Yard', cameraDetails: details });
+
+    assert.match(camera({ model: 'SSOBCM4', status: 'offline', supportedFeatures: { battery: true }, cameraStatus: { batteryPercentage: 84 } }).diagnostics(),
+        /^Back Yard: SSOBCM4 via simplisafe, battery 84%, asleep or offline$/);
+    assert.match(camera({ model: 'SS002', status: 'offline', supportedFeatures: { wired: true } }).diagnostics(), /status offline$/);
+});

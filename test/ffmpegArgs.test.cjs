@@ -48,9 +48,9 @@ test('flattens groups into spawn arguments', () => {
     assert.deepEqual(flattenFfmpegArgs([['-r', 20], [' -i ', ' url '], ['-re']]), ['-r', '20', '-i', 'url', '-re']);
 });
 
-test('redacts the access token from logged arguments', () => {
+test('redacts the access token and stream key from logged arguments', () => {
     assert.deepEqual(
-        redactFfmpegArgs(['-headers', 'Authorization: Bearer eyJhbGciOi.abc.def', '-i', 'https://1.2.3.4/v1/x/flv']),
-        ['-headers', 'Authorization: Bearer [REDACTED]', '-i', 'https://1.2.3.4/v1/x/flv']
+        redactFfmpegArgs(['-headers', 'Authorization: Bearer eyJhbGciOi.abc.def', '-i', 'https://1.2.3.4/v1/x/flv', '-srtp_out_params', 'c2VjcmV0LWtleQ==', 'srtp://192.168.1.5:5000']),
+        ['-headers', 'Authorization: Bearer [REDACTED]', '-i', 'https://1.2.3.4/v1/x/flv', '-srtp_out_params', '[REDACTED]', 'srtp://192.168.1.5:5000']
     );
 });

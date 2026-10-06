@@ -1,6 +1,11 @@
 # Change Log
 All notable changes are documented here.
 
+## Unreleased
+- Confirmed on real hardware: motion from every Outdoor Camera and the Video Doorbell Pro reaches HomeKit; live view started 0.9-2.7s after opening a plugged-in camera and 1.5-9.8s for one on battery
+- HomeKit stream encryption keys are no longer written to debug logs (stream requests and the ffmpeg command), and stream requests are logged in one line
+- Logs for Claude: the once-a-minute socket heartbeat is kept every 15 minutes, SimpliSafe's frequent cameraStatus messages are logged once, sleeping battery cameras read 'asleep or offline'
+
 ## 1.12.0-beta.3, homebridge-simplisafe3-edited (2026-10-06)
 Install, or update an earlier beta, next to the original plugin (see the README):
 ```

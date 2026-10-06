@@ -145,3 +145,25 @@ test('readDiagnostics returns the redacted file for the settings page, or explai
     assert.ok(!result.text.includes('abc123'));
     assert.ok(result.updatedAt > 0);
 }));
+
+test('removes HomeKit stream keys, from request dumps and ffmpeg commands', () => {
+    const dump = "{ video: { port: 57857, srtp_key: <Buffer 57 d3 08 22 01 a8>, srtp_salt: <Buffer 0e 7f c0 f0> } }";
+    const command = 'ffmpeg -i x -srtp_out_params c2VjcmV0LWtleQ== srtp://192.168.1.145:57857';
+
+    const redacted = redact(dump) + redact(command);
+    for (const secret of ['57 d3 08 22', '0e 7f c0 f0', 'c2VjcmV0LWtleQ==']) assert.ok(!redacted.includes(secret));
+    assert.ok(redacted.includes('port: 57857'));
+    assert.ok(redacted.includes('srtp://192.168.1.145:57857'));
+});
+
+test('the once-a-minute socket heartbeat is kept only every 15 minutes', () => {
+    let now = 0;
+    const diagnostics = new DiagnosticLog({ file: '/dev/null', version: '1', flushDelay: 60000, now: () => now });
+
+    for (let minute = 0; minute <= 30; minute++) {
+        now = minute * 60000;
+        diagnostics.record('info', ['SSAPI socket `heartbeat`']);
+    }
+
+    assert.match(diagnostics.contents(), /--- 3 log lines ---/);
+});

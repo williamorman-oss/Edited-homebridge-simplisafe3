@@ -77,7 +77,11 @@ class SS3Camera extends SimpliSafe3Accessory {
             const level = this.batteryLevel();
             parts.push(`battery ${level === null ? '?' : level}%${this.isCharging() ? ' charging' : ''}`);
         }
-        if (this.cameraDetails.status) parts.push(`status ${this.cameraDetails.status}`);
+        if (this.cameraDetails.status) {
+            // SimpliSafe reports a sleeping battery camera as offline
+            const asleep = this.isBatteryPowered() && this.cameraDetails.status === 'offline';
+            parts.push(asleep ? 'asleep or offline' : `status ${this.cameraDetails.status}`);
+        }
         if (this.streamingDelegate) parts.push(this.streamingDelegate.diagnostics());
         return parts.join(', ');
     }

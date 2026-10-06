@@ -281,7 +281,8 @@ class StreamingDelegate {
     }
 
     prepareStream(request, callback) {
-        if (this.ss3Camera.debug) this.log('Prepare stream with request:', request);
+        // one line, the request carries the stream's encryption keys
+        if (this.ss3Camera.debug) this.log(`Prepare stream for '${this.ss3Camera.name}' to ${request.targetAddress}`);
         let response = {};
         let sessionInfo = {
             address: request.targetAddress
@@ -358,7 +359,14 @@ class StreamingDelegate {
     }
 
     async handleStreamRequest(request, callback) {
-        if (this.ss3Camera.debug) this.log('handleStreamRequest with request:', request);
+        if (this.ss3Camera.debug) {
+            const video = request.video;
+            const audio = request.audio;
+            const details = request.type == 'start' && video
+                ? `: ${video.width}x${video.height} at ${video.fps} fps, ${video.max_bit_rate} kbps${audio ? `, ${audio.codec} audio at ${audio.sample_rate} kHz` : ''}`
+                : '';
+            this.log(`Stream ${request.type} for '${this.ss3Camera.name}'${details}`);
+        }
 
         if (this.ss3Camera.getStreamProvider() === 'livekit' && request.type == 'start') {
             let sessionIdentifier = this.api.hap.uuid.unparse(request.sessionID);

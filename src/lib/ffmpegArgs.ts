@@ -54,7 +54,9 @@ export function flattenFfmpegArgs(args: FfmpegArg[]): string[] {
     return args.flat().map(arg => typeof arg === 'string' ? arg.trim() : String(arg));
 }
 
-// The source headers carry the SimpliSafe access token
+// The source headers carry the SimpliSafe access token, -srtp_out_params the stream's encryption key
 export function redactFfmpegArgs(args: string[]): string[] {
-    return args.map(arg => arg.replace(/(Bearer\s+)\S+/gi, '$1[REDACTED]'));
+    return args
+        .map((arg, i) => args[i - 1] === '-srtp_out_params' ? '[REDACTED]' : arg)
+        .map(arg => arg.replace(/(Bearer\s+)\S+/gi, '$1[REDACTED]'));
 }

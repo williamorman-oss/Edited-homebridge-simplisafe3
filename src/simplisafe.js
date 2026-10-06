@@ -625,7 +625,15 @@ class SimpliSafe3 extends EventEmitter {
                     // Ignore event as it doesn't relate to this account
                     return;
                 }
-                if (this.debug) this.log(`SSAPI event ${data.eventCid} (${data.eventType}) from sensor type ${data.sensorType} serial ${data.sensorSerial}${data.internal && data.internal.mainCamera ? `, camera ${data.internal.mainCamera}` : ''}`);
+                if (this.debug) {
+                    if (data.eventType === 'cameraStatus') {
+                        // arrives every few seconds while cameras wake and sleep, show what one holds once
+                        if (!this.loggedCameraStatus) this.log('SSAPI cameraStatus message (only the first is logged):', JSON.stringify(data).slice(0, 1500));
+                        this.loggedCameraStatus = true;
+                    } else {
+                        this.log(`SSAPI event ${data.eventCid} (${data.eventType}) from sensor type ${data.sensorType} serial ${data.sensorSerial}${data.internal && data.internal.mainCamera ? `, camera ${data.internal.mainCamera}` : ''}`);
+                    }
+                }
 
                 switch (data.eventType) {
                 case 'alarm':
