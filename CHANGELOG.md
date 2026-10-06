@@ -1,6 +1,20 @@
 # Change Log
 All notable changes are documented here.
 
+## 1.12.0-beta.6, homebridge-simplisafe3-edited (2026-10-06)
+Install, or update an earlier beta, next to the original plugin (see the README):
+```
+INSTALL_COMMAND_PENDING
+```
+
+Diagnostics for HomeKit recording and two-way audio. Nothing changes in HomeKit.
+- Fix: the SimpliSafe subscription number appeared in 'LiveKit: joined room' lines in Logs for Claude. Removed, and redaction now also removes it from older log files when the card shows them
+- With Debug on, the logs give each camera's capabilities in one short line, when cameras wake and sleep, how late SimpliSafe's motion and doorbell events arrive and the clip SimpliSafe records for them, what the plugin may publish in an Outdoor Camera's room (whether talking is possible), and the Outdoor Cameras' video format, keyframe spacing and audio timing
+- New temporary `motionTest` camera option: after each motion or doorbell event it measures how soon the camera's video arrives and how soon SimpliSafe's own clip of the event can be read. It wakes battery cameras, so switch it off after the test
+- Fix: an unexpected live-view reply from SimpliSafe was written to the log in full, signed links and credentials included. Only its field names are logged now
+- Fix: account numbers that mix letters and digits were only partly removed from Logs for Claude
+- Fix: a doorbell press for a camera with no doorbell in HomeKit threw an error
+
 ## 1.12.0-beta.5, homebridge-simplisafe3-edited (2026-10-06)
 Install, or update an earlier beta, next to the original plugin (see the README):
 ```
