@@ -35,6 +35,13 @@ Once you are happy with it, turn off `cameras` in the original plugin so cameras
 
 To remove this version, uninstall **SimpliSafe 3 (Edited)** from the Plugins page and remove its bridge from the Home app. If installing or updating any plugin ever fails with a 404 for `homebridge-simplisafe3-edited`, run `npm uninstall --prefix /var/lib/homebridge homebridge-simplisafe3-edited` and then install it again with the current link. Restoring a Homebridge backup does not reinstall this version (it is not on npm), run the install command again afterwards.
 
+### Logs for Claude
+The plugin's settings page has a **Logs for Claude** card. It shows this plugin's recent log lines (up to about 800), each camera's state at the top, and a **Copy logs for Claude** button to paste them into a conversation with Claude.
+
+- Removed before anything is kept: passwords, tokens, email addresses, MAC addresses, Wi-Fi names and account numbers. Camera serial numbers stay, they are needed to match events to cameras.
+- The lines are kept in `simplisafe3-edited-logs.txt` in the Homebridge storage folder, written at most every 10 seconds. The plugin does not send them anywhere.
+- Turn on **Debug** (Advanced Options) for detail such as live view and snapshot timings. Turn off **Keep Logs for Claude** (`"logsForClaude": false`) to stop keeping them.
+
 ## Requirements
 - Works with native Homebridge and [oznu/docker-homebridge](https://github.com/oznu/docker-homebridge).
 - Compatible with the official [Config UI X plugin](https://github.com/oznu/homebridge-config-ui-x) which is **recommended for easiest usage**.

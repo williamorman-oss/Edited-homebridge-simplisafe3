@@ -1,7 +1,7 @@
 {
   "name": "homebridge-simplisafe3-edited",
   "displayName": "SimpliSafe 3 (Edited)",
-  "version": "1.12.0-beta.2",
+  "version": "1.12.0-beta.3",
   "private": true,
   "description": "SimpliSafe 3 for Homebridge with faster cameras and Outdoor Camera support. Installs alongside homebridge-simplisafe3.",
   "author": "Niccol\u00f2 Zapponi, shamoon",

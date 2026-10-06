@@ -28,6 +28,7 @@ class SS3Camera extends SimpliSafe3Accessory {
         }
 
         const delegate = new StreamingDelegate(this);
+        this.streamingDelegate = delegate;
         this.controller = delegate.controller;
 
         if (this.isUnsupported()) {
@@ -67,6 +68,18 @@ class SS3Camera extends SimpliSafe3Accessory {
             if (!this.accessory.getService(BatteryService)) this.accessory.addService(BatteryService);
             this.updateBatteryService();
         }
+    }
+
+    // One line on this camera's state, for the logs
+    diagnostics() {
+        const parts = [`${this.name}: ${this.cameraDetails.model || 'camera'} via ${this.getWebRTCProvider() || 'simplisafe'}`];
+        if (this.isBatteryPowered()) {
+            const level = this.batteryLevel();
+            parts.push(`battery ${level === null ? '?' : level}%${this.isCharging() ? ' charging' : ''}`);
+        }
+        if (this.cameraDetails.status) parts.push(`status ${this.cameraDetails.status}`);
+        if (this.streamingDelegate) parts.push(this.streamingDelegate.diagnostics());
+        return parts.join(', ');
     }
 
     // Older HAP-NodeJS only has BatteryService

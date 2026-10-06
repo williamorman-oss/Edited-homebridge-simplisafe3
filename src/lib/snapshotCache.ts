@@ -106,9 +106,11 @@ class SnapshotCache {
             timeoutID = setTimeout(() => reject(new Error(`Timed out after ${timeout / 1000}s`)), timeout);
         });
 
+        const startedAt = this.now();
         const refresh = Promise.race([this.options.fetch(), timedOut])
             .then(image => {
                 this.set(image);
+                if (this.options.debug && this.options.log) this.options.log(`Refreshed snapshot for '${this.options.name}' in ${((this.now() - startedAt) / 1000).toFixed(1)}s`);
                 if (this.failures && this.options.log) this.options.log(`Snapshots for '${this.options.name}' recovered`);
                 this.failures = 0;
                 this.retryAt = 0;

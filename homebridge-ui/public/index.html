@@ -27,7 +27,25 @@
         <label for="redirect-url-input">Redirected URL</label>
         <input type="text" class="form-control" id="redirect-url-input" aria-describedby="auth-redirect-help">
         <small id="auth-redirect-help" class="form-text text-muted">Enter the full URL</small>
+      </div>
     </div>
+  </div>
+</div>
+
+<div class="card mt-3">
+  <div class="card-body">
+    <h5 class="card-title">Logs for Claude</h5>
+    <p class="form-text small">
+      Recent log lines from this plugin, with passwords, tokens, email addresses, MAC addresses, Wi-Fi names and account numbers removed.
+      Copy them and paste them into your conversation with Claude. Nothing is sent anywhere by the plugin.
+      For more detail turn on <strong>Debug</strong> under Advanced Options and restart the plugin.
+    </p>
+    <div class="mb-2">
+      <button type="button" id="logs-copy" class="btn btn-primary btn-sm">Copy logs for Claude</button>
+      <button type="button" id="logs-refresh" class="btn btn-secondary btn-sm">Refresh</button>
+      <small id="logs-status" class="text-muted ml-2"></small>
+    </div>
+    <textarea id="logs-text" class="form-control" rows="12" readonly spellcheck="false" style="font-family: monospace; font-size: 11px;"></textarea>
   </div>
 </div>
 
@@ -52,7 +70,50 @@ $.fn.slideUpFadeOut = function(speed) {
     return this.slideUp(speed) && this.fadeOut(speed);
 };
 
+const loadLogs = async () => {
+  const response = await homebridge.request('/diagnostics');
+  if (response.success) {
+    $('#logs-text').val(response.text);
+    $('#logs-status').text(`${response.lines} lines, written ${new Date(response.updatedAt).toLocaleTimeString()}`);
+  } else {
+    $('#logs-text').val('');
+    $('#logs-status').text(response.error);
+  }
+};
+
+// Copies straight from the click, browsers only allow it during one. The clipboard API needs https,
+// which Homebridge often isn't served over, so fall back to copying the selected text
+const copyLogs = () => {
+  const text = $('#logs-text').val();
+  if (!text) {
+    homebridge.toast.error('There are no logs to copy yet.', 'Nothing to copy');
+    return;
+  }
+
+  const copied = () => homebridge.toast.success('Paste them into your conversation with Claude.', 'Logs copied');
+  const selectInstead = () => {
+    const field = $('#logs-text')[0];
+    field.focus();
+    field.select();
+    let ok = false;
+    try {
+      ok = document.execCommand('copy');
+    } catch (e) { /* not allowed */ }
+    if (ok) copied();
+    else homebridge.toast.warning('The logs are selected, press Ctrl+C or Cmd+C to copy them.', 'Copy them yourself');
+  };
+
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(copied, selectInstead);
+  } else {
+    selectInstead();
+  }
+};
+
 (async () => {
+  $('#logs-refresh').click(loadLogs);
+  $('#logs-copy').click(copyLogs);
+
   $('#redirect-url').slideUpFadeOut(0);
   $('#auth-exists').slideUpFadeOut(0);
 
@@ -64,6 +125,7 @@ $.fn.slideUpFadeOut = function(speed) {
   }
 
   homebridge.showSchemaForm();
+  loadLogs();
 
   const credentialsExistResponse = await homebridge.request('/credentialsExist');
   if (credentialsExistResponse.success && credentialsExistResponse.credentialsExist) {

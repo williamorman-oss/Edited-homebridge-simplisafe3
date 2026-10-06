@@ -1,6 +1,7 @@
 import path from 'path';
 import SimpliSafe3, { SENSOR_TYPES, SYSTEM_UPDATED, RateLimitError } from './simplisafe';
 import SimpliSafe3AuthenticationManager from './lib/authManager';
+import DiagnosticLog, { diagnosticsFilename } from './lib/diagnosticLog';
 import Alarm from './accessories/alarm';
 import EntrySensor from './accessories/entrySensor';
 import MotionSensor from './accessories/motionSensor';
@@ -20,11 +21,17 @@ const DEFAULT_CAMERAS_ONLY = true;
 
 const cameraRefreshInterval = 10 * 60 * 1000; // ms, keeps camera battery and charging state current
 
+let PLUGIN_VERSION = 'unknown';
+try {
+    PLUGIN_VERSION = require('./package.json').version; // package.json sits next to index.js once built
+} catch (err) { /* running from source */ }
+
 let UUIDGen;
 
 class SS3Platform {
 
     constructor(log, config, api) {
+        log = this.keepLogsForClaude(log, config, api);
         this.log = log;
         this.name = config.name;
         // only cameras, e.g. to run them on their own bridge next to another instance with the alarm and sensors
@@ -176,6 +183,25 @@ class SS3Platform {
                 }
             }
         }
+    }
+
+    // Keeps this plugin's recent log lines, without secrets, for the settings page's 'Logs for Claude' card
+    keepLogsForClaude(log, config, api) {
+        if (config.logsForClaude === false) return log;
+
+        this.diagnosticLog = new DiagnosticLog({
+            file: path.join(api.user.storagePath(), diagnosticsFilename),
+            version: PLUGIN_VERSION,
+            summary: () => this.cameraSummary()
+        });
+        api.on('shutdown', () => this.diagnosticLog.flush(true));
+        return this.diagnosticLog.wrap(log);
+    }
+
+    cameraSummary() {
+        const cameras = (this.devices || []).filter(device => device instanceof Camera);
+        if (!cameras.length) return '';
+        return cameras.map(camera => camera.diagnostics()).join('\n');
     }
 
     // Camera details, e.g. battery level, are only fetched with the alarm system, so pass on every update

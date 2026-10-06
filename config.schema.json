@@ -44,6 +44,11 @@
         "type": "boolean",
         "default": true
       },
+      "logsForClaude": {
+        "title": " Keep Logs for Claude",
+        "type": "boolean",
+        "default": true
+      },
       "cameraOptions": {
         "type": "object",
         "properties": {
@@ -141,6 +146,10 @@
           "description": "Find your account number under SS web control panel > View Account. See README for more info."
         },
         "sensorRefresh",
+        {
+          "key": "logsForClaude",
+          "description": "Keep this plugin's recent log lines, without passwords, tokens or account numbers, for the 'Logs for Claude' card on this page. Nothing is sent anywhere."
+        },
         {
           "key": "persistAccessories",
           "description": "By default, the plugin won't remove old accessories from the Home app. This is to avoid caching issues causing you to lose all your scenes & automations configurations. If you do want to remove old accessories, set this to false."

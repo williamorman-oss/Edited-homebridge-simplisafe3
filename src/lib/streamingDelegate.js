@@ -133,6 +133,16 @@ class StreamingDelegate {
         this.controller = cameraController;
     }
 
+    diagnostics() {
+        const age = this.snapshots.age();
+        const liveViews = Object.keys(this.liveKitSessions).length + Object.keys(this.ongoingSessions).length;
+        return [
+            age === Infinity ? 'no snapshot yet' : `snapshot ${Math.round(age / 1000)}s old`,
+            this.snapshots.failures ? `${this.snapshots.failures} snapshot failures` : null,
+            liveViews ? `${liveViews} live view(s) running` : null
+        ].filter(part => part).join(', ');
+    }
+
     // Read through the camera so periodic refreshes (battery, charging) are seen here too
     get cameraDetails() {
         return this.ss3Camera.cameraDetails;
@@ -328,6 +338,7 @@ class StreamingDelegate {
 
         // Join now, the handshake takes several seconds which is too slow to run inside handleStreamRequest
         if (this.ss3Camera.getStreamProvider() === 'livekit') {
+            sessionInfo.preparedAt = Date.now();
             sessionInfo.liveKitSource = new LiveKitSource(this.ss3Camera);
             sessionInfo.liveKitReady = sessionInfo.liveKitSource.connect();
             sessionInfo.liveKitReady.catch(() => {}); // handled in handleStreamRequest
@@ -751,7 +762,8 @@ class StreamingDelegate {
 
         sessionInfo.liveKitReady
             .then(() => {
-                if (this.ss3Camera.debug) this.log(`Streaming '${this.ss3Camera.name}' from LiveKit without transcoding`);
+                const waited = sessionInfo.preparedAt ? `, first video ${((Date.now() - sessionInfo.preparedAt) / 1000).toFixed(1)}s after the live view was requested` : '';
+                if (this.ss3Camera.debug) this.log(`Streaming '${this.ss3Camera.name}' from LiveKit without transcoding${waited}`);
                 startAudio();
             })
             .catch(err => {
