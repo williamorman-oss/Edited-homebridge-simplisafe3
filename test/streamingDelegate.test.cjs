@@ -1,5 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { EventEmitter } = require('node:events');
 
 const StreamingDelegate = require('../dist/lib/streamingDelegate').default;
 
@@ -23,6 +24,69 @@ function createApiStub() {
         },
     };
 }
+
+// Stands in for LiveKitSource: connect() resolves or rejects when the test says so
+class FakeLiveKitSource extends EventEmitter {
+    constructor() {
+        super();
+        this.closed = false;
+        this.streaming = false;
+        this.keyframeRequests = 0;
+        this.ready = new Promise((resolve, reject) => { this.connected = resolve; this.failed = reject; });
+    }
+
+    connect() { return this.ready; }
+
+    close() {
+        this.closed = true;
+        this.streaming = false;
+        this.removeAllListeners();
+    }
+
+    requestKeyframe() { this.keyframeRequests++; return true; }
+
+    timeoutMessage(ms) { return `Timed out after ${ms / 1000}s`; }
+
+    // a keyframe as RTP: SPS, PPS and an IDR slice sharing a timestamp
+    sendKeyframe(timestamp = 1000) {
+        [[0x67, 1], [0x68, 2], [0x65, 3]].forEach((payload, i) => {
+            this.emit('video', { payload: Buffer.from(payload), header: { timestamp, marker: i === 2, sequenceNumber: i, ssrc: 42 } });
+        });
+    }
+}
+
+function useFakeLiveKit(delegate) {
+    const created = [];
+    delegate.createLiveKitSource = () => {
+        const source = new FakeLiveKitSource();
+        created.push(source);
+        return source;
+    };
+    return created;
+}
+
+function liveKitStreamRequest(sessionID) {
+    return {
+        targetAddress: '192.168.1.5',
+        sessionID,
+        video: { port: 5010, srtp_key: Buffer.alloc(16, 1), srtp_salt: Buffer.alloc(14, 2) },
+        audio: { port: 5011, srtp_key: Buffer.alloc(16, 3), srtp_salt: Buffer.alloc(14, 4) },
+    };
+}
+
+async function startLiveView(delegate, sessionID) {
+    delegate.prepareStream(liveKitStreamRequest(sessionID), () => {});
+    let args;
+    await delegate.handleStreamRequest({
+        sessionID,
+        type: 'start',
+        video: { width: 1280, height: 720, fps: 20, max_bit_rate: 299 },
+        audio: { codec: 'OPUS', sample_rate: 24 },
+    }, (...a) => { args = a; });
+    return args;
+}
+
+const tick = () => new Promise((resolve) => setImmediate(resolve));
 
 function createCameraStub(overrides = {}) {
     return {
@@ -385,13 +449,12 @@ test('a running live view keeps the snapshot current', async () => {
 
 test('startLiveKitStream reports setup failures instead of leaving HAP hanging', () => {
     const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
-    let closed = false;
+    const created = useFakeLiveKit(delegate);
     const sessionInfo = {
         address: '192.168.1.5',
         video_port: 5010,
         video_srtp: undefined,                             // makes createSrtpSession throw
-        liveKitSource: { close: () => { closed = true; } },
-        liveKitReady: Promise.resolve(),
+        liveKit: delegate.acquireLiveKitSource(),
     };
 
     let callbackArgs;
@@ -399,7 +462,8 @@ test('startLiveKitStream reports setup failures instead of leaving HAP hanging',
 
     assert.ok(callbackArgs, 'callback must always be called');
     assert.ok(callbackArgs[0] instanceof Error);
-    assert.equal(closed, true, 'the pre-warmed source must be closed');
+    assert.equal(created[0].closed, true, 'the pre-warmed source must be closed');
+    assert.equal(delegate.liveKitShared, null);
 });
 
 test('a failed ffmpeg start answers HomeKit exactly once', async () => {
@@ -441,4 +505,156 @@ test('stream requests are logged in one line, without the stream keys', async ()
     assert.ok(lines.some((line) => line === "Stream stop for 'Garage Camera'"));
     assert.ok(!lines.join('\n').includes('srtp'));
     assert.ok(!lines.join('\n').includes('1234567890'));
+});
+
+test('a live view opened while a snapshot is being taken shares its connection', async () => {
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
+    const created = useFakeLiveKit(delegate);
+    delegate.jpegFromKeyframe = async () => Buffer.from('jpeg');
+    const forwarded = [];
+    delegate.forwardRtp = (rtp, srtp, socket, payloadType, ssrc) => forwarded.push(ssrc);
+
+    const snapshot = delegate.warmSnapshot();             // wakes the camera
+    const started = await startLiveView(delegate, 'live-1');
+
+    assert.equal(started[0], undefined);
+    assert.equal(created.length, 1, 'the live view joins the snapshot\'s connection');
+    const source = created[0];
+
+    source.streaming = true;
+    source.connected();
+    await tick();
+    source.sendKeyframe();
+
+    assert.equal((await snapshot).toString(), 'jpeg');
+    assert.equal(forwarded.length, 3, 'the same packets reach the live view');
+    assert.equal(source.closed, false, 'the live view still uses the connection');
+
+    await delegate.handleStreamRequest({ sessionID: 'live-1', type: 'stop' }, () => {});
+    assert.equal(source.closed, true, 'closed as soon as nobody uses it');
+    assert.equal(delegate.liveKitShared, null);
+});
+
+test('a second viewer joins a running stream and asks for a keyframe', async () => {
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
+    const created = useFakeLiveKit(delegate);
+    delegate.forwardRtp = () => {};
+
+    await startLiveView(delegate, 'phone');
+    const source = created[0];
+    source.streaming = true;
+    source.connected();
+    await tick();
+    assert.equal(source.keyframeRequests, 0, 'a new connection starts with a keyframe anyway');
+
+    await startLiveView(delegate, 'tablet');
+    assert.equal(created.length, 1);
+    assert.equal(source.keyframeRequests, 1);
+
+    await delegate.handleStreamRequest({ sessionID: 'phone', type: 'stop' }, () => {});
+    assert.equal(source.closed, false);
+    assert.equal(source.listenerCount('video'), 1, 'only the stopped viewer stops receiving');
+
+    await delegate.handleStreamRequest({ sessionID: 'tablet', type: 'stop' }, () => {});
+    assert.equal(source.closed, true);
+});
+
+test('a dropped connection stops every live view on it and the next one reconnects', async () => {
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
+    const created = useFakeLiveKit(delegate);
+    delegate.forwardRtp = () => {};
+    const forceStopped = [];
+    delegate.controller.forceStopStreamingSession = (id) => forceStopped.push(id);
+
+    await startLiveView(delegate, 'phone');
+    await startLiveView(delegate, 'tablet');
+    const source = created[0];
+    source.streaming = true;
+    source.connected();
+    await tick();
+
+    // what LiveKitSource does when the room goes away under a running stream
+    const listeners = source.listeners('ended');
+    source.close();
+    listeners.forEach((listener) => listener('signalling closed'));
+
+    assert.deepEqual(forceStopped.sort(), ['phone', 'tablet']);
+    assert.deepEqual(Object.keys(delegate.liveKitSessions), []);
+    assert.equal(delegate.liveKitShared, null);
+
+    delegate.acquireLiveKitSource();
+    assert.equal(created.length, 2, 'a closed connection is never reused');
+});
+
+test('a failed join is not reused and HomeKit is told the stream stopped', async () => {
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
+    const created = useFakeLiveKit(delegate);
+    const forceStopped = [];
+    delegate.controller.forceStopStreamingSession = (id) => forceStopped.push(id);
+
+    await startLiveView(delegate, 'phone');
+    created[0].failed(new Error('Timed out after 30s waiting for video'));
+    await tick();
+
+    assert.equal(created[0].closed, true);
+    assert.deepEqual(forceStopped, ['phone']);
+    assert.equal(delegate.liveKitShared, null);
+
+    delegate.acquireLiveKitSource();
+    assert.equal(created.length, 2);
+});
+
+test('a snapshot that gives up does not close the connection a live view is waiting on', async () => {
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
+    const created = useFakeLiveKit(delegate);
+    delegate.forwardRtp = () => {};
+
+    const lease = delegate.acquireLiveKitSource();         // as warmSnapshot does
+    await startLiveView(delegate, 'phone');
+    delegate.releaseLiveKitSource(lease);
+    delegate.releaseLiveKitSource(lease);                  // releasing twice counts once
+
+    assert.equal(created[0].closed, false);
+    assert.equal(delegate.liveKitShared.users, 1);
+
+    await delegate.handleStreamRequest({ sessionID: 'phone', type: 'stop' }, () => {});
+    assert.equal(created[0].closed, true);
+});
+
+test('a live view prepared but never started gives the connection back', () => {
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
+    const created = useFakeLiveKit(delegate);
+
+    const timers = [];
+    const realSetTimeout = global.setTimeout;
+    global.setTimeout = (fn, ms) => { timers.push({ fn, ms }); return 0; };
+    try {
+        delegate.prepareStream(liveKitStreamRequest('abandoned'), () => {});
+    } finally {
+        global.setTimeout = realSetTimeout;
+    }
+    assert.equal(created[0].closed, false);
+
+    timers.find((timer) => timer.ms === 20000).fn();       // HomeKit never sent 'start'
+    assert.equal(created[0].closed, true);
+    assert.deepEqual(delegate.pendingSessions, {});
+});
+
+test('forwarding re-stamps a copy, the packet other viewers get is unchanged', () => {
+    const { RtpHeader } = require('werift');
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
+    const header = new RtpHeader({ payloadType: 96, ssrc: 1234, sequenceNumber: 7, timestamp: 90000, marker: true, extension: true, extensions: [{ id: 1, payload: Buffer.from([1]) }] });
+    const rtp = { header, payload: Buffer.from([0x65, 1]) };
+
+    let sent;
+    delegate.forwardRtp(rtp, { encrypt: (payload, h) => { sent = h; return Buffer.alloc(1); } }, { send: () => {} }, 99, 5555, 5010, '192.168.1.5');
+
+    assert.equal(sent.payloadType, 99);
+    assert.equal(sent.ssrc, 5555);
+    assert.equal(sent.sequenceNumber, 7);
+    assert.equal(sent.marker, true);
+    assert.equal(sent.extension, false);
+    assert.equal(header.payloadType, 96);
+    assert.equal(header.ssrc, 1234);
+    assert.equal(header.extension, true);
 });

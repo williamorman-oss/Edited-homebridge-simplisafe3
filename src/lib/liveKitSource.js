@@ -1,3 +1,4 @@
+import { EventEmitter } from 'events';
 import WebSocket from 'ws';
 import { RTCPeerConnection, RTCRtpCodecParameters } from 'werift';
 import {
@@ -9,32 +10,34 @@ import {
 } from '@livekit/protocol';
 
 const trackTimeout = 30000; // ms, how long a live view waits for the camera's video
+const keyframeRequestInterval = 1000; // ms, at most one keyframe request a second
 
-// LiveKit subscriber. werift gives the encoded RTP so H.264 can be passed to HomeKit untouched
-class LiveKitSource {
+// LiveKit subscriber. werift gives the encoded RTP so H.264 can be passed to HomeKit untouched.
+// Emits 'video' and 'audio' with every RTP packet, so a snapshot and live views can share one connection,
+// and 'ended' when a running session dies on us, not on a deliberate close
+class LiveKitSource extends EventEmitter {
     constructor(ss3Camera) {
+        super();
         this.ss3Camera = ss3Camera;
         this.simplisafe = ss3Camera.simplisafe;
         this.log = ss3Camera.log;
         this.debug = ss3Camera.debug;
-
-        this.onVideoRtp = null;
-        this.onAudioRtp = null;
-        this.onSessionEnded = null;
 
         this.ws = null;
         this.pc = null;
         this.pingIntervalID = null;
         this.closed = false;
         this.streaming = false;
+        this.videoTrack = null;
+        this.videoSsrc = null;
+        this.lastKeyframeRequest = 0;
     }
 
-    // Fires only when a running session dies on us, not on a deliberate close
     _sessionEnded(reason) {
         if (this.closed || !this.streaming) return;
-        const notify = this.onSessionEnded;
+        const listeners = this.listeners('ended');
         this.close();
-        if (notify) notify(reason);
+        for (const listener of listeners) listener(reason);
     }
 
     // Resolves once the first video RTP packet arrives i.e. media is flowing.
@@ -42,7 +45,7 @@ class LiveKitSource {
     async connect(timeoutMs = trackTimeout) {
         let timeoutID;
         const timedOut = new Promise((resolve, reject) => {
-            timeoutID = setTimeout(() => reject(new Error(this._timeoutMessage(timeoutMs))), timeoutMs);
+            timeoutID = setTimeout(() => reject(new Error(this.timeoutMessage(timeoutMs))), timeoutMs);
         });
 
         try {
@@ -52,7 +55,7 @@ class LiveKitSource {
         }
     }
 
-    _timeoutMessage(timeoutMs) {
+    timeoutMessage(timeoutMs) {
         const details = this.ss3Camera.cameraDetails || {};
         const features = details.supportedFeatures || {};
         let hint = '';
@@ -191,19 +194,22 @@ class LiveKitSource {
             knownTracks.add(track);
             if (this.debug) this.log(`LiveKit: subscribed to ${track.kind} (${track.codec && track.codec.mimeType})`);
 
+            if (track.kind === 'video') this.videoTrack = track;
+
             track.onReceiveRtp.subscribe(rtp => {
                 if (this.closed) return;
 
                 if (track.kind === 'video') {
                     this.streaming = true;
+                    this.videoSsrc = rtp.header.ssrc;
                     if (this._onFirstVideo) {
                         const notify = this._onFirstVideo;
                         this._onFirstVideo = null;
                         notify();
                     }
-                    if (this.onVideoRtp) this.onVideoRtp(rtp);
-                } else if (this.onAudioRtp) {
-                    this.onAudioRtp(rtp);
+                    this.emit('video', rtp);
+                } else {
+                    this.emit('audio', rtp);
                 }
             });
         });
@@ -215,15 +221,29 @@ class LiveKitSource {
         }
     }
 
+    // Asks the camera, through LiveKit, for a keyframe. Someone joining a running stream otherwise
+    // waits for the camera's next scheduled one before there is a picture
+    requestKeyframe() {
+        if (this.closed || !this.pc || this.videoSsrc === null) return false;
+        if (Date.now() - this.lastKeyframeRequest < keyframeRequestInterval) return false;
+
+        const receivers = this.pc.getTransceivers().filter(t => t.kind === 'video').map(t => t.receiver);
+        const receiver = receivers.find(r => r.track === this.videoTrack) || receivers[0];
+        if (!receiver) return false;
+
+        this.lastKeyframeRequest = Date.now();
+        receiver.sendRtcpPLI(this.videoSsrc).catch(() => {});
+        if (this.debug) this.log(`LiveKit: asked ${this.ss3Camera.name} for a keyframe`);
+        return true;
+    }
+
     close() {
         if (this.closed) return;
         this.closed = true;
 
         clearInterval(this.pingIntervalID);
         this.streaming = false;
-        this.onVideoRtp = null;
-        this.onAudioRtp = null;
-        this.onSessionEnded = null;
+        this.removeAllListeners();
 
         try {
             if (this.pc) this.pc.close();

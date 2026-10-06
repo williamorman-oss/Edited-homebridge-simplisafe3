@@ -7,7 +7,7 @@ import { localIPv4Address } from './network';
 import path from 'path';
 import fs from 'fs';
 import dgram from 'dgram';
-import { SrtpSession, ProtectionProfileAes128CmHmacSha1_80 } from 'werift';
+import { SrtpSession, ProtectionProfileAes128CmHmacSha1_80, RtpHeader } from 'werift';
 
 import LiveKitSource from './liveKitSource';
 import KeyframeCollector from './h264';
@@ -38,6 +38,15 @@ const legacySnapshotTimeout = 10000; // ms
 const liveKitSnapshotTimeout = 20000; // ms to join and wake a camera, battery cameras took 5-6s from sleep
 const alarmStateTimeout = 3000; // ms to wait for the alarm state when it is not known yet
 
+// Rejects with the message unless the promise settles within ms
+function withTimeout(promise, ms, message) {
+    let timeoutID;
+    const timedOut = new Promise((resolve, reject) => {
+        timeoutID = setTimeout(() => reject(new Error(message)), ms);
+    });
+    return Promise.race([promise, timedOut]).finally(() => clearTimeout(timeoutID));
+}
+
 const privacyShutterImage = path.resolve(__dirname, '..', 'images', 'privacyshutter_snapshot.png');
 const privacyShutterImageInBytes = fs.readFileSync(privacyShutterImage);
 const unsupportedCameraImage = path.resolve(__dirname, '..', 'images', 'unsupportedcamera_snapshot.png');
@@ -56,6 +65,7 @@ class StreamingDelegate {
         this.pendingSessions = {};
         this.ongoingSessions = {};
         this.liveKitSessions = {};
+        this.liveKitShared = null;
         this.snapshotBusy = false;
         this.snapshotWidth = 1280;
 
@@ -340,15 +350,13 @@ class StreamingDelegate {
         // Join now, the handshake takes several seconds which is too slow to run inside handleStreamRequest
         if (this.ss3Camera.getStreamProvider() === 'livekit') {
             sessionInfo.preparedAt = Date.now();
-            sessionInfo.liveKitSource = new LiveKitSource(this.ss3Camera);
-            sessionInfo.liveKitReady = sessionInfo.liveKitSource.connect();
-            sessionInfo.liveKitReady.catch(() => {}); // handled in handleStreamRequest
+            sessionInfo.liveKit = this.acquireLiveKitSource(); // failures are handled in handleStreamRequest
 
             // HomeKit does not always follow up with a 'start', don't hold the room open waiting
             sessionInfo.prepareTimeoutID = setTimeout(() => {
                 if (this.pendingSessions[sessionIdentifier] !== sessionInfo) return;
                 delete this.pendingSessions[sessionIdentifier];
-                sessionInfo.liveKitSource.close();
+                this.releaseLiveKitSource(sessionInfo.liveKit);
                 if (this.ss3Camera.debug) this.log(`Closed LiveKit session for '${this.ss3Camera.name}' that was prepared but never started`);
             }, prepareTimeout);
         }
@@ -620,15 +628,11 @@ class StreamingDelegate {
         });
     }
 
-    // Re-stamp RTP for HomeKit then encrypt with the keys it gave us in prepareStream
+    // Re-stamp RTP for HomeKit then encrypt with the keys it gave us in prepareStream.
+    // The packet is shared with other live views and the snapshot, so it is copied rather than changed
     forwardRtp(rtp, srtp, socket, payloadType, ssrc, port, address) {
-        let header = rtp.header;
-        header.payloadType = payloadType;
-        header.ssrc = ssrc;
-        header.extension = false;
-        header.extensions = [];
-
         try {
+            let header = new RtpHeader({ ...rtp.header, payloadType: payloadType, ssrc: ssrc, extension: false, extensions: [] });
             socket.send(srtp.encrypt(rtp.payload, header), port, address);
         } catch (e) {
             if (this.ss3Camera.debug) this.log.error('Error forwarding RTP to HomeKit:', e.message);
@@ -659,31 +663,76 @@ class StreamingDelegate {
         });
     }
 
-    // Briefly joins the room to grab a keyframe, used when nothing is streaming
+    createLiveKitSource() {
+        return new LiveKitSource(this.ss3Camera);
+    }
+
+    // One LiveKit connection per camera, shared by snapshots and live views. Waking a battery camera takes
+    // seconds, so a live view opened while a snapshot is being taken joins that wake-up rather than starting
+    // its own, and a second viewer joins the first. It closes as soon as nobody uses it, so sharing never
+    // keeps a camera awake. Returns a lease to give back with releaseLiveKitSource
+    acquireLiveKitSource() {
+        let shared = this.liveKitShared;
+        let reused = !!shared && !shared.source.closed;
+
+        if (reused) {
+            if (this.ss3Camera.debug) this.log(`Reusing the LiveKit connection to '${this.ss3Camera.name}'`);
+        } else {
+            let source = this.createLiveKitSource();
+            shared = { source: source, users: 0, ready: source.connect() };
+            // a failed join is not reused, the next snapshot or live view starts a new one
+            shared.ready.catch(() => this.closeLiveKitSource(shared));
+            this.liveKitShared = shared;
+        }
+
+        shared.users++;
+        return { shared: shared, source: shared.source, ready: shared.ready, reused: reused, released: false };
+    }
+
+    releaseLiveKitSource(lease) {
+        if (!lease || lease.released) return;
+        lease.released = true;
+        lease.shared.users--;
+        if (lease.shared.users <= 0) this.closeLiveKitSource(lease.shared);
+    }
+
+    closeLiveKitSource(shared) {
+        shared.source.close();
+        if (this.liveKitShared === shared) this.liveKitShared = null;
+    }
+
+    // Grabs a keyframe from the camera, joining its room unless a live view is already connecting
     async warmSnapshot() {
-        let source = new LiveKitSource(this.ss3Camera);
+        let lease = this.acquireLiveKitSource();
+        let source = lease.source;
         let keyframe = new KeyframeCollector();
 
-        let captured = new Promise(resolve => {
-            source.onVideoRtp = rtp => {
+        let onVideo;
+        let onEnded;
+        let captured = new Promise((resolve, reject) => {
+            onVideo = rtp => {
                 keyframe.push(rtp.payload, rtp.header);
                 if (keyframe.complete) resolve(keyframe.annexB());
             };
+            onEnded = reason => reject(new Error(`LiveKit session ended: ${reason}`));
         });
+        captured.catch(() => {}); // a session that ends during the join fails the join instead
+        source.on('video', onVideo);
+        source.on('ended', onEnded);
 
-        let timeoutID;
         try {
-            await source.connect(liveKitSnapshotTimeout);
-            let annexB = await Promise.race([captured, new Promise((resolve, reject) => {
-                timeoutID = setTimeout(() => reject(new Error('Timed out waiting for a keyframe')), keyframeTimeout);
-            })]);
+            // joining a stream that is already running, ask for a keyframe rather than wait for the next one
+            if (source.streaming) source.requestKeyframe();
+            await withTimeout(lease.ready, liveKitSnapshotTimeout, source.timeoutMessage(liveKitSnapshotTimeout));
+            let annexB = await withTimeout(captured, keyframeTimeout, 'Timed out waiting for a keyframe');
             let jpeg = await this.jpegFromKeyframe(annexB);
 
             if (this.ss3Camera.debug) this.log(`Cached snapshot for '${this.ss3Camera.name}' (${Math.round(jpeg.length / 1000)}kB)`);
             return jpeg;
         } finally {
-            clearTimeout(timeoutID);
-            source.close();
+            source.off('video', onVideo);
+            source.off('ended', onEnded);
+            this.releaseLiveKitSource(lease);
         }
     }
 
@@ -707,7 +756,7 @@ class StreamingDelegate {
         clearTimeout(sessionInfo.prepareTimeoutID);
 
         if (this.simplisafe.isBlocked && Date.now() < this.simplisafe.nextAttempt) {
-            sessionInfo.liveKitSource.close();
+            this.releaseLiveKitSource(sessionInfo.liveKit);
             let err = new Error('Camera stream request blocked (rate limited)');
             this.log.error(err);
             callback(err);
@@ -719,27 +768,35 @@ class StreamingDelegate {
         } catch (err) {
             this.log.error(`Could not start LiveKit stream for '${this.ss3Camera.name}':`, err.message);
             this.stopLiveKitStream(sessionIdentifier);
-            sessionInfo.liveKitSource.close();
+            this.releaseLiveKitSource(sessionInfo.liveKit);
             callback(err);
         }
     }
 
     setupLiveKitStream(request, sessionIdentifier, sessionInfo, callback) {
-        let source = sessionInfo.liveKitSource;
-        let socket = dgram.createSocket('udp4');
+        let lease = sessionInfo.liveKit;
+        let source = lease.source;
         let videoSrtp = this.createSrtpSession(sessionInfo.video_srtp);
+        let socket = dgram.createSocket('udp4');
         let keyframe = new KeyframeCollector();
 
-        let session = { source: source, socket: socket, stopped: false };
+        // the listeners are removed again when the live view stops, the connection may outlive it
+        let session = { lease: lease, socket: socket, stopped: false, listeners: {} };
         this.liveKitSessions[sessionIdentifier] = session;
+        let listen = (event, listener) => {
+            session.listeners[event] = listener;
+            source.on(event, listener);
+        };
 
-        source.onVideoRtp = rtp => {
+        listen('video', rtp => {
             if (this.snapshots.age() >= streamSnapshotInterval) {
                 keyframe.push(rtp.payload, rtp.header);
                 if (keyframe.complete) this.cacheSnapshotFromStream(keyframe);
             }
             this.forwardRtp(rtp, videoSrtp, socket, videoPayloadType, sessionInfo.video_ssrc, sessionInfo.video_port, sessionInfo.address);
-        };
+        });
+        // video already flowing, e.g. to a snapshot or another viewer, HomeKit needs a keyframe to start from
+        if (source.streaming) source.requestKeyframe();
 
         // Deferred until LiveKit has connected
         let startAudio = () => {
@@ -751,30 +808,33 @@ class StreamingDelegate {
             }
 
             let audioSrtp = this.createSrtpSession(sessionInfo.audio_srtp);
-            source.onAudioRtp = rtp => {
+            listen('audio', rtp => {
                 this.forwardRtp(rtp, audioSrtp, socket, audioPayloadType, sessionInfo.audio_ssrc, sessionInfo.audio_port, sessionInfo.address);
-            };
+            });
             if (this.ss3Camera.debug) this.log(`Audio: forwarding Opus to ${sessionInfo.address}:${sessionInfo.audio_port}`);
         };
 
-        source.onSessionEnded = reason => {
+        listen('ended', reason => {
             this.log.error(`LiveKit session for '${this.ss3Camera.name}' ended: ${reason}`);
             this.stopLiveKitStream(sessionIdentifier);
             try {
                 this.controller.forceStopStreamingSession(request.sessionID);
             } catch (e) { /* session may already be gone */ }
-        };
+        });
 
         // Media starts once the pre-warmed join finishes, HomeKit is acked now so it does not time out
         callback();
 
-        sessionInfo.liveKitReady
+        lease.ready
             .then(() => {
+                if (session.stopped) return;
                 const waited = sessionInfo.preparedAt ? `, first video ${((Date.now() - sessionInfo.preparedAt) / 1000).toFixed(1)}s after the live view was requested` : '';
-                if (this.ss3Camera.debug) this.log(`Streaming '${this.ss3Camera.name}' from LiveKit without transcoding${waited}`);
+                const shared = lease.reused ? ' on the connection that was already open' : '';
+                if (this.ss3Camera.debug) this.log(`Streaming '${this.ss3Camera.name}' from LiveKit without transcoding${waited}${shared}`);
                 startAudio();
             })
             .catch(err => {
+                if (session.stopped) return; // closed in the Home app before the video came
                 this.log.error(`LiveKit stream failed for '${this.ss3Camera.name}':`, err.message);
                 this.stopLiveKitStream(sessionIdentifier);
                 try {
@@ -783,17 +843,14 @@ class StreamingDelegate {
             });
     }
 
-
-
-
-
     stopLiveKitStream(sessionIdentifier) {
         let session = this.liveKitSessions[sessionIdentifier];
         if (!session) return;
         session.stopped = true;
         delete this.liveKitSessions[sessionIdentifier];
 
-        try { session.source.close(); } catch (e) { /* already gone */ }
+        for (let [event, listener] of Object.entries(session.listeners)) session.lease.source.off(event, listener);
+        this.releaseLiveKitSource(session.lease);
         try { session.socket.close(); } catch (e) { /* already gone */ }
     }
 }
