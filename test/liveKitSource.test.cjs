@@ -180,6 +180,62 @@ test('joining logs the camera name, not the room name that ends in the subscript
     const source = new LiveKitSource(createCamera({ debug: true, log }));
     source._handleJoin({ iceServers: [], room: { name: '719f3d450fdb48f5a3a1a2ccf125bfe8_1234567' } }, () => {});
 
-    assert.deepEqual(lines, ['LiveKit: joined the room for Back Yard']);
+    assert.equal(lines[0], 'LiveKit: joined the room for Back Yard');
+    assert.ok(!lines.join('\n').includes('1234567'));
     source.close();
+});
+
+test('the room summary says what the plugin may publish and who else is there, without identities', () => {
+    const p = require('@livekit/protocol');
+    const lines = [];
+    const log = (...args) => lines.push(args.join(' '));
+    log.error = log;
+    const source = new LiveKitSource(createCamera({ debug: true, log }));
+
+    const join = p.SignalResponse.fromBinary(new p.SignalResponse({ message: { case: 'join', value: new p.JoinResponse({
+        room: new p.Room({ name: 'abc_7654321', sid: 'RM_secretroom' }),
+        participant: new p.ParticipantInfo({ sid: 'PA_mine', identity: 'user-7654321', permission: new p.ParticipantPermission({ canPublish: true, canSubscribe: true, canPublishSources: [p.TrackSource.MICROPHONE] }) }),
+        otherParticipants: [new p.ParticipantInfo({ sid: 'PA_camera', identity: 'camera-identity-x', name: 'Back Yard owner@example.com', metadata: '{"sid":7654321}', isPublisher: true, state: p.ParticipantInfo_State.ACTIVE,
+            tracks: [new p.TrackInfo({ sid: 'TR_video', type: p.TrackType.VIDEO, source: p.TrackSource.CAMERA, mimeType: 'video/H264', width: 1920, height: 1080 }),
+                new p.TrackInfo({ sid: 'TR_audio', type: p.TrackType.AUDIO, source: p.TrackSource.MICROPHONE, mimeType: 'audio/opus', name: 'mic 7654321' })] })],
+        serverInfo: new p.ServerInfo({ version: '1.9.0', protocol: 16, nodeId: 'node-secret', region: 'region-secret' }),
+        enabledPublishCodecs: [new p.Codec({ mime: 'audio/red' }), new p.Codec({ mime: 'audio/opus' })],
+    }) } }).toBinary()).message.value;
+    source._handleJoin(join, () => {});
+
+    const text = lines.join('\n');
+    assert.match(text, /canPublish true \(MICROPHONE\), canSubscribe true/);
+    assert.match(text, /publish codecs audio\/red,audio\/opus/);
+    assert.match(text, /STANDARD\/ACTIVE publisher \[VIDEO\/CAMERA video\/H264 1920x1080, AUDIO\/MICROPHONE audio\/opus\]/);
+    for (const secret of ['7654321', 'RM_secretroom', 'PA_', 'TR_', 'user-', 'camera-identity', 'owner@', 'node-secret', 'region-secret']) {
+        assert.ok(!text.includes(secret), `${secret} must not be logged`);
+    }
+    source.close();
+});
+
+test('the camera\'s H.264 profile, level and keyframe spacing are logged once, and keyframes are announced', () => {
+    const lines = [];
+    const log = (...args) => lines.push(args.join(' '));
+    log.error = log;
+    const source = new LiveKitSource(createCamera({ debug: true, log }));
+    const receive = joinWithTracks(source);
+    let keyframes = 0;
+    source.on('keyframe', () => keyframes++);
+
+    // SPS for Main 4.0 and PPS in a STAP-A, then the IDR as an FU-A over two packets, every 2s at 90 kHz
+    const sps = Buffer.from([0x67, 77, 0x40, 40, 0xaa]);
+    const pps = Buffer.from([0x68, 0xce]);
+    const stap = Buffer.concat([Buffer.from([24, 0, sps.length]), sps, Buffer.from([0, pps.length]), pps]);
+    for (let i = 0; i < 5; i++) {
+        const timestamp = (4294000000 + i * 180000) >>> 0;              // wraps around 2^32
+        receive.video({ header: { ssrc: 1, timestamp }, payload: stap });
+        receive.video({ header: { ssrc: 1, timestamp }, payload: Buffer.from([28, 0x85, 1]) });   // FU-A start of an IDR
+        receive.video({ header: { ssrc: 1, timestamp }, payload: Buffer.from([28, 0x45, 2]) });   // FU-A end
+        receive.video({ header: { ssrc: 1, timestamp: (timestamp + 4500) >>> 0 }, payload: Buffer.from([0x41, 3]) }); // P frame
+    }
+
+    assert.equal(keyframes, 5);
+    assert.deepEqual(lines.filter((line) => line.includes('video H.264')), ['LiveKit: Back Yard video H.264 Main 4.0, keyframes 2.0s, 2.0s, 2.0s apart']);
+    source.close();
+    assert.equal(lines.filter((line) => line.includes('video H.264')).length, 1, 'not logged again on close');
 });

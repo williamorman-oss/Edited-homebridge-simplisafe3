@@ -40,7 +40,8 @@ The plugin's settings page has a **Logs for Claude** card. It shows this plugin'
 
 - Removed before anything is kept: passwords, tokens, email addresses, MAC addresses, Wi-Fi names and account numbers. Camera serial numbers stay, they are needed to match events to cameras.
 - The lines are kept in `simplisafe3-edited-logs.txt` in the Homebridge storage folder, written at most every 10 seconds. The plugin does not send them anywhere.
-- Turn on **Debug** (Advanced Options) for detail such as live view and snapshot timings. Turn off **Keep Logs for Claude** (`"logsForClaude": false`) to stop keeping them.
+- Turn on **Debug** (Advanced Options) for detail such as live view and snapshot timings, each camera's capabilities, when cameras wake and sleep, how late SimpliSafe's motion and doorbell events arrive, and the video and audio format of Outdoor Cameras. Turn off **Keep Logs for Claude** (`"logsForClaude": false`) to stop keeping them.
+- **Motion Test** (`cameraOptions.motionTest`, Advanced Camera Settings) is for a test session only. After each motion or doorbell event it measures how soon the camera's video arrives and how soon SimpliSafe's own clip of the event, which starts a few seconds before it, can be read. Each event then wakes a battery camera (at most once a minute per camera), so turn it off again afterwards. Reading the clip sends the SimpliSafe login only to simplisafe.com, and no links are logged.
 
 ## Requirements
 - Works with native Homebridge and [oznu/docker-homebridge](https://github.com/oznu/docker-homebridge).
@@ -182,7 +183,8 @@ For advanced scenarios including specifying a custom ffmpeg build or command lin
     "sourceOptions": "-probesize 500000",
     "videoOptions": "-preset ultrafast -tune false",
     "audioOptions": "-b:a 32k",
-    "batterySnapshotMinutes": 10
+    "batterySnapshotMinutes": 10,
+    "motionTest": false
 }
 ```
 

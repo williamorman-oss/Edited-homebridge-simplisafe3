@@ -14,6 +14,8 @@ import KeyframeCollector from './h264';
 import SnapshotCache from './snapshotCache';
 import { fetchMjpegFrame } from './mjpeg';
 import { applyFfmpegOptions, flattenFfmpegArgs, redactFfmpegArgs } from './ffmpegArgs';
+import { eventClip, opusPacketDuration, simplisafeUrl, linkName } from './diagnosticLines';
+import { probeClip, httpGet, domainOf } from './clipProbe';
 
 const dnsLookup = promisify(dns.lookup);
 
@@ -37,6 +39,19 @@ const staleSnapshotMinAge = 5 * 60000; // ms before a camera that keeps failing 
 const legacySnapshotTimeout = 10000; // ms
 const liveKitSnapshotTimeout = 20000; // ms to join and wake a camera, battery cameras took 5-6s from sleep
 const alarmStateTimeout = 3000; // ms to wait for the alarm state when it is not known yet
+// motionTest option: how soon video could follow a motion or doorbell event
+const motionTestCooldown = 60000; // ms per camera, each test wakes a battery camera
+const motionTestTimeout = 30000; // ms to wait for the camera's video or SimpliSafe's clip
+const clipRetryInterval = 2000; // ms between attempts to read SimpliSafe's clip of the event
+
+// Why the last attempt to read a clip failed, without the error text, which can hold the link
+function describeFailure(result) {
+    if (!result) return '';
+    if (result.status && result.status !== 200) return `, last HTTP ${result.status}`;
+    if (result.error === 'no segments yet' || result.error === 'first segment not available') return `, last: ${result.error}`;
+    if (result.error) return /timed out/.test(result.error) ? ', last request timed out' : ', last request failed';
+    return ', nothing readable in what arrived';
+}
 
 // Rejects with the message unless the promise settles within ms
 function withTimeout(promise, ms, message) {
@@ -182,7 +197,8 @@ class StreamingDelegate {
                 if (this.ss3Camera.debug) this.log(`'${this.ss3Camera.name}' has not responded for ${Math.round(this.snapshots.age() / 60000)} minutes, sending a placeholder`);
                 callback(undefined, snapshotUnavailableImage);
             } else if (image) {
-                if (this.ss3Camera.debug) this.log(`Closed '${this.ss3Camera.name}' snapshot request with ${Math.round(image.length / 1000)}kB image from ${Math.round(this.snapshots.age() / 1000)}s ago`);
+                const sinceEvent = notBefore && this.ss3Camera.lastEventAt ? `, ${((Date.now() - this.ss3Camera.lastEventAt) / 1000).toFixed(1)}s after the motion or doorbell event` : '';
+                if (this.ss3Camera.debug) this.log(`Closed '${this.ss3Camera.name}' snapshot request with ${Math.round(image.length / 1000)}kB image from ${Math.round(this.snapshots.age() / 1000)}s ago${sinceEvent}`);
                 callback(undefined, image);
             } else {
                 if (this.ss3Camera.debug) this.log(`No snapshot available yet for '${this.ss3Camera.name}', sending a placeholder`);
@@ -371,7 +387,7 @@ class StreamingDelegate {
             const video = request.video;
             const audio = request.audio;
             const details = request.type == 'start' && video
-                ? `: ${video.width}x${video.height} at ${video.fps} fps, ${video.max_bit_rate} kbps${audio ? `, ${audio.codec} audio at ${audio.sample_rate} kHz` : ''}`
+                ? `: ${video.width}x${video.height} at ${video.fps} fps, ${video.max_bit_rate} kbps${audio ? `, ${audio.codec} audio at ${audio.sample_rate} kHz in ${audio.packet_time} ms packets` : ''}`
                 : '';
             this.log(`Stream ${request.type} for '${this.ss3Camera.name}'${details}`);
         }
@@ -828,7 +844,15 @@ class StreamingDelegate {
             }
 
             let audioSrtp = this.createSrtpSession(sessionInfo.audio_srtp);
+            let audioTiming = this.ss3Camera.debug ? [] : null;
             listen('audio', rtp => {
+                if (audioTiming) {
+                    audioTiming.push(rtp);
+                    if (audioTiming.length === 10) {
+                        this.log(`Audio for '${this.ss3Camera.name}': ${this.describeAudioTiming(audioTiming, request.audio)}`);
+                        audioTiming = null;
+                    }
+                }
                 this.forwardRtp(rtp, audioSrtp, socket, audioPayloadType, sessionInfo.audio_ssrc, sessionInfo.audio_port, sessionInfo.address);
             });
             if (this.ss3Camera.debug) this.log(`Audio: forwarding Opus to ${sessionInfo.address}:${sessionInfo.audio_port}`);
@@ -861,6 +885,126 @@ class StreamingDelegate {
                     this.controller.forceStopStreamingSession(request.sessionID);
                 } catch (e) { /* session may already be gone */ }
             });
+    }
+
+    // How the camera's Opus packets are timed, next to what HomeKit asked for. HomeKit may expect timestamps
+    // at the sample rate it asked for and a different packet length than WebRTC's 20 ms at 48 kHz
+    describeAudioTiming(packets, requested) {
+        const steps = [];
+        for (let i = 1; i < packets.length; i++) {
+            const step = (packets[i].header.timestamp - packets[i - 1].header.timestamp) >>> 0;
+            if (step) steps.push(step);
+        }
+        steps.sort((a, b) => a - b);
+        const step = steps.length ? steps[Math.floor(steps.length / 2)] : null;
+        const duration = opusPacketDuration(packets[packets.length - 1].payload);
+        const clock = step && duration ? `${Math.round(step / duration)} kHz clock` : 'clock unknown';
+        return `camera sends ${duration === null ? '?' : duration} ms Opus packets, timestamps ${step === null ? '?' : step} apart (${clock}); HomeKit asked for ${requested ? requested.sample_rate : '?'} kHz in ${requested ? requested.packet_time : '?'} ms packets`;
+    }
+
+    // The motionTest option. After a motion or doorbell event, measures how soon the camera's video arrives
+    // over LiveKit and how soon SimpliSafe's own clip of the event, which starts a few seconds before it, can
+    // be read. Both decide how HomeKit recordings can start close to the motion. Wakes a battery camera
+    async runMotionTest(event, receivedAt) {
+        if (this.motionTestRunning || Date.now() - (this.lastMotionTestAt || 0) < motionTestCooldown) return;
+        if (this.simplisafe.isBlocked && Date.now() < this.simplisafe.nextAttempt) return;
+        this.motionTestRunning = true;
+        this.lastMotionTestAt = Date.now();
+
+        try {
+            await Promise.all([
+                this.ss3Camera.getStreamProvider() === 'livekit' ? this.measureLiveKitAfterEvent(receivedAt) : null,
+                this.probeEventClip(event, receivedAt),
+                this.probeEventSnapshot(event, receivedAt)
+            ]);
+        } finally {
+            this.motionTestRunning = false;
+        }
+    }
+
+    async measureLiveKitAfterEvent(receivedAt) {
+        const name = this.ss3Camera.name;
+        const since = () => ((Date.now() - receivedAt) / 1000).toFixed(1);
+        const status = this.ss3Camera.liveStatus ? `camera ${this.ss3Camera.liveStatus} at the event` : 'camera status unknown';
+        const lease = this.acquireLiveKitSource();
+        const source = lease.source;
+        const joined = lease.reused ? 'on a connection already open' : 'new connection';
+
+        let onKeyframe;
+        const keyframe = new Promise(resolve => {
+            onKeyframe = () => resolve(since());
+        });
+        source.once('keyframe', onKeyframe);
+
+        try {
+            await withTimeout(lease.ready, motionTestTimeout, source.timeoutMessage(motionTestTimeout));
+            const video = since();
+            if (source.streaming && lease.reused) source.requestKeyframe();
+            const first = await withTimeout(keyframe, 10000, 'no keyframe within 10s');
+            this.log(`Motion test for '${name}': video ${video}s and first keyframe ${first}s after the event arrived (${joined}, ${status})`);
+        } catch (err) {
+            this.log(`Motion test for '${name}': no video after ${since()}s (${joined}, ${status}): ${err.message}`);
+        } finally {
+            source.off('keyframe', onKeyframe);
+            this.releaseLiveKitSource(lease);
+        }
+    }
+
+    // How soon SimpliSafe's own clip of the event, which starts a few seconds before it, can be read
+    async probeEventClip(event, receivedAt) {
+        const name = this.ss3Camera.name;
+        const clip = eventClip(event);
+        if (!clip) {
+            this.log(`Clip test for '${name}': the event names no SimpliSafe clip`);
+            return;
+        }
+        const links = clip._links || {};
+        const kind = links['playback/hls'] ? 'HLS' : 'FLV';
+        const link = links['playback/hls'] || links['playback/flv'];
+        const url = link && simplisafeUrl(link.href);
+        if (!url) {
+            this.log(`Clip test for '${name}': no playback link on simplisafe.com (links ${Object.keys(links).map(linkName).join('|') || 'none'})`);
+            return;
+        }
+
+        const preroll = typeof clip.preroll === 'number' ? `starts ${clip.preroll}s before the event` : 'pre-roll unknown';
+        let attempts = 0;
+        let last = null;
+        while (Date.now() - receivedAt < motionTestTimeout) {
+            attempts++;
+            const result = await probeClip(url, kind, { token: this.ss3Camera.authManager.accessToken, ffmpegPath: this.ss3Camera.ffmpegPath });
+            if (result.readable) {
+                this.log(`Clip test for '${name}': ${kind} clip (${preroll}) readable ${((Date.now() - receivedAt) / 1000).toFixed(1)}s after the event arrived, attempt ${attempts}; ${result.details}`);
+                return;
+            }
+            last = result;
+            await new Promise(resolve => setTimeout(resolve, clipRetryInterval));
+        }
+        this.log(`Clip test for '${name}': ${kind} clip (${preroll}) not readable within ${motionTestTimeout / 1000}s, ${attempts} attempts${describeFailure(last)}`);
+    }
+
+    // How soon SimpliSafe's still image of the event can be fetched, which could serve motion notifications
+    async probeEventSnapshot(event, receivedAt) {
+        const name = this.ss3Camera.name;
+        const clip = eventClip(event);
+        const link = clip && clip._links && clip._links['snapshot/jpg'];
+        const url = link && simplisafeUrl(link.href);
+        if (!url) return;
+
+        let attempts = 0;
+        let last = null;
+        while (Date.now() - receivedAt < motionTestTimeout) {
+            attempts++;
+            const result = await httpGet(url, { token: this.ss3Camera.authManager.accessToken, maxBytes: 5 * 1024 * 1024 });
+            const image = result.status === 200 && result.body && result.body[0] === 0xFF && result.body[1] === 0xD8 ? result.body : null;
+            if (image) {
+                this.log(`Clip test for '${name}': SimpliSafe's image of the event ready ${((Date.now() - receivedAt) / 1000).toFixed(1)}s after it arrived, attempt ${attempts}, ${Math.round(image.length / 1000)}kB from ${domainOf(result.host)}`);
+                return;
+            }
+            last = result;
+            await new Promise(resolve => setTimeout(resolve, clipRetryInterval));
+        }
+        this.log(`Clip test for '${name}': SimpliSafe's image of the event not ready within ${motionTestTimeout / 1000}s, ${attempts} attempts${describeFailure(last)}`);
     }
 
     stopLiveKitStream(sessionIdentifier) {

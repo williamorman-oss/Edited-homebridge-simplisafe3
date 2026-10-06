@@ -8,6 +8,8 @@ import {
     TrickleRequest,
     SignalTarget
 } from '@livekit/protocol';
+import { rtpNalUnits, describeSps } from './h264';
+import { liveKitJoin, liveKitLeave, liveKitRequestResponse, participants } from './diagnosticLines';
 
 const trackTimeout = 30000; // ms, how long a live view waits for the camera's video
 const keyframeRequestInterval = 1000; // ms, at most one keyframe request a second
@@ -32,6 +34,13 @@ class LiveKitSource extends EventEmitter {
         this.videoSsrc = null;
         this.lastKeyframeRequest = 0;
         this.keyframeRequestID = null;
+
+        // what the camera sends, logged once per connection
+        this.videoFormat = null;
+        this.keyframeTimestamps = [];
+        this.lastKeyframeTimestamp = null;
+        this.loggedSignals = new Set();
+        this.lastParticipants = null;
     }
 
     _sessionEnded(reason) {
@@ -113,6 +122,12 @@ class LiveKitSource extends EventEmitter {
                 }
 
                 const message = response.message;
+                const known = ['join', 'offer', 'trickle', 'update', 'requestResponse', 'leave', 'pong', 'pongResp'];
+                if (this.debug && message.case && !known.includes(message.case) && !this.loggedSignals.has(message.case)) {
+                    // only the kind of message, some carry tokens
+                    this.loggedSignals.add(message.case);
+                    this.log(`LiveKit: ${this.ss3Camera.name} sent a '${message.case}' message`);
+                }
 
                 switch (message.case) {
                 case 'join':
@@ -142,8 +157,16 @@ class LiveKitSource extends EventEmitter {
                     }
                     break;
 
+                case 'update':
+                    this._logParticipants(message.value.participants);
+                    break;
+
+                case 'requestResponse':
+                    if (this.debug) this.log(`LiveKit: ${this.ss3Camera.name} request answered, ${liveKitRequestResponse(message.value)}`);
+                    break;
+
                 case 'leave':
-                    if (this.debug) this.log('LiveKit: server ended the session');
+                    if (this.debug) this.log(`LiveKit: server ended the session for ${this.ss3Camera.name}, ${liveKitLeave(message.value)}`);
                     settle(new Error('LiveKit server ended the session'));
                     this._sessionEnded('server ended the session');
                     this.close();
@@ -158,7 +181,11 @@ class LiveKitSource extends EventEmitter {
     _handleJoin(join, send) {
         if (this.closed) return;
         // the room name ends in the subscription number, so it is not logged
-        if (this.debug) this.log(`LiveKit: joined the room for ${this.ss3Camera.name}`);
+        if (this.debug) {
+            this.log(`LiveKit: joined the room for ${this.ss3Camera.name}`);
+            this.log(`LiveKit: ${this.ss3Camera.name} room: ${liveKitJoin(join)}`);
+            this.lastParticipants = participants(join.otherParticipants);
+        }
 
         this.pc = new RTCPeerConnection({
             iceServers: (join.iceServers || []).map(server => ({
@@ -204,6 +231,7 @@ class LiveKitSource extends EventEmitter {
                 if (track.kind === 'video') {
                     this.streaming = true;
                     this.videoSsrc = rtp.header.ssrc;
+                    this._watchVideo(rtp);
                     if (this._onFirstVideo) {
                         const notify = this._onFirstVideo;
                         this._onFirstVideo = null;
@@ -221,6 +249,40 @@ class LiveKitSource extends EventEmitter {
                 send({ message: { case: 'ping', value: BigInt(Date.now()) } });
             }, join.pingInterval * 1000);
         }
+    }
+
+    // Who is in the room changed, e.g. the SimpliSafe app started talking through the camera
+    _logParticipants(list) {
+        if (!this.debug) return;
+        const summary = participants(list);
+        if (summary === this.lastParticipants) return;
+        this.lastParticipants = summary;
+        this.log(`LiveKit: ${this.ss3Camera.name} participants: ${summary}`);
+    }
+
+    // Notes the camera's H.264 profile and level and how often it sends keyframes, which decide whether
+    // its video can be recorded without re-encoding. Emits 'keyframe' as each keyframe starts
+    _watchVideo(rtp) {
+        for (const nal of rtpNalUnits(rtp.payload)) {
+            if (nal.type === 7 && nal.data && !this.videoFormat) this.videoFormat = describeSps(nal.data);
+            if (nal.type !== 5 || rtp.header.timestamp === this.lastKeyframeTimestamp) continue;
+
+            this.lastKeyframeTimestamp = rtp.header.timestamp;
+            this.emit('keyframe', rtp);
+            if (this.keyframeTimestamps.length < 4) {
+                this.keyframeTimestamps.push(rtp.header.timestamp);
+                if (this.keyframeTimestamps.length === 4 && this.debug) this.log(`LiveKit: ${this.ss3Camera.name} video ${this._videoDescription()}`);
+            }
+        }
+    }
+
+    _videoDescription() {
+        const gaps = [];
+        for (let i = 1; i < this.keyframeTimestamps.length; i++) {
+            gaps.push((((this.keyframeTimestamps[i] - this.keyframeTimestamps[i - 1]) >>> 0) / 90000).toFixed(1));
+        }
+        const spacing = gaps.length ? `keyframes ${gaps.join('s, ')}s apart` : `${this.keyframeTimestamps.length} keyframe(s)`;
+        return `H.264 ${this.videoFormat || 'profile unknown'}, ${spacing}`;
     }
 
     // Asks the camera, through LiveKit, for a keyframe. Someone joining a running stream otherwise
@@ -254,6 +316,9 @@ class LiveKitSource extends EventEmitter {
     close() {
         if (this.closed) return;
         this.closed = true;
+
+        // a connection too short to log the keyframe spacing still says what the camera sent
+        if (this.debug && this.streaming && this.keyframeTimestamps.length < 4) this.log(`LiveKit: ${this.ss3Camera.name} video ${this._videoDescription()}`);
 
         clearInterval(this.pingIntervalID);
         clearTimeout(this.keyframeRequestID);

@@ -720,3 +720,47 @@ test('a stop for a live view that never started gives the connection back at onc
     assert.equal(created[0].closed, true);
     assert.deepEqual(delegate.pendingSessions, {});
 });
+
+test('the motion test measures how soon video and a keyframe follow the event, then gives the connection back', async () => {
+    const lines = [];
+    const log = (...args) => lines.push(args.join(' '));
+    log.error = log;
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit', log, liveStatus: 'online' }));
+    const created = useFakeLiveKit(delegate);
+
+    const running = delegate.runMotionTest({ eventCid: 1170 }, Date.now());
+    await tick();
+    const source = created[0];
+    source.streaming = true;
+    source.connected();
+    await tick();
+    source.emit('keyframe', {});
+    await running;
+
+    assert.match(lines.find((line) => line.startsWith('Motion test')), /^Motion test for 'Garage Camera': video \d+\.\ds and first keyframe \d+\.\ds after the event arrived \(new connection, camera online at the event\)$/);
+    assert.ok(lines.includes("Clip test for 'Garage Camera': the event names no SimpliSafe clip"));
+    assert.equal(source.closed, true);
+
+    await delegate.runMotionTest({ eventCid: 1170 }, Date.now());
+    assert.equal(created.length, 1, 'at most one test a minute per camera');
+});
+
+test('a clip link that is not on simplisafe.com is never fetched and never logged', async () => {
+    const lines = [];
+    const log = (...args) => lines.push(args.join(' '));
+    log.error = log;
+    const delegate = new StreamingDelegate(createCameraStub({ log }));
+
+    const event = { videoStartedBy: 'cam', video: { cam: { preroll: 5, _links: { 'playback/flv': { href: 'https://evil.example/7654321/clip.flv' }, 'snapshot/jpg': { href: 'http://media.simplisafe.com/7654321/x.jpg' } } } } };
+    await delegate.runMotionTest(event, Date.now());
+
+    assert.deepEqual(lines, ["Clip test for 'Garage Camera': no playback link on simplisafe.com (links playback/flv|snapshot/jpg)"]);
+});
+
+test('audio timing compares the camera\'s Opus packets with what HomeKit asked for', () => {
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
+    const packets = Array.from({ length: 10 }, (_, i) => ({ header: { timestamp: (4294966000 + i * 960) >>> 0 }, payload: Buffer.from([0xfc, 0]) }));
+
+    assert.equal(delegate.describeAudioTiming(packets, { sample_rate: 24, packet_time: 20 }),
+        'camera sends 20 ms Opus packets, timestamps 960 apart (48 kHz clock); HomeKit asked for 24 kHz in 20 ms packets');
+});

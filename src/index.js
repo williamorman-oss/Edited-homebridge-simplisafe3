@@ -2,6 +2,7 @@ import path from 'path';
 import SimpliSafe3, { SENSOR_TYPES, SYSTEM_UPDATED, RateLimitError } from './simplisafe';
 import SimpliSafe3AuthenticationManager from './lib/authManager';
 import DiagnosticLog, { diagnosticsFilename } from './lib/diagnosticLog';
+import { cameraCapabilities } from './lib/diagnosticLines';
 import Alarm from './accessories/alarm';
 import EntrySensor from './accessories/entrySensor';
 import MotionSensor from './accessories/motionSensor';
@@ -412,6 +413,8 @@ class SS3Platform {
 
                     if (this.debug) {
                         this.log(`Discovered camera '${cameraName}' from SimpliSafe:`, JSON.stringify(camera));
+                        // the details above are too long for Logs for Claude, this is what matters in them
+                        this.log(`Camera '${cameraName}' ${cameraCapabilities(camera)}`);
                     }
 
                     if (camera.serial && this.excludedDevices.includes(camera.serial)) {

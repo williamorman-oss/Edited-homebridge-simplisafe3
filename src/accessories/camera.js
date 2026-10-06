@@ -6,6 +6,7 @@ import SimpliSafe3Accessory from './ss3Accessory';
 import { EVENT_TYPES } from '../simplisafe';
 
 import StreamingDelegate from '../lib/streamingDelegate';
+import { eventClip, eventTime } from '../lib/diagnosticLines';
 
 const lowBatteryLevel = 20; // %
 
@@ -18,6 +19,9 @@ class SS3Camera extends SimpliSafe3Accessory {
         this.reachable = true;
         this.nSocketConnectFailures = 0;
         this.lastEventAt = 0;
+        // from SimpliSafe's camera status messages: whether the camera is awake, and since when
+        this.liveStatus = null;
+        this.liveStatusAt = 0;
         // the last snapshot is kept on disk so tiles have an image straight after a restart
         if (platformOptions.snapshotDir) this.snapshotPath = path.join(platformOptions.snapshotDir, `${id}.jpg`);
 
@@ -181,10 +185,54 @@ class SS3Camera extends SimpliSafe3Accessory {
         return typeof level === 'number' ? Math.max(0, Math.min(100, Math.round(level))) : null;
     }
 
+    // Seconds between SimpliSafe's timestamp for an event and now, when it reached the plugin. Events only
+    // carry whole seconds, so this is approximate
+    eventDelay(data) {
+        const time = eventTime(data);
+        return time === null ? null : (Date.now() - time) / 1000;
+    }
+
+    // For debug logs: how late an event arrived, what the camera was doing, and the clip SimpliSafe records
+    describeEvent(data) {
+        const delay = this.eventDelay(data);
+        const parts = [delay === null ? 'with no timestamp' : `about ${delay.toFixed(1)}s after SimpliSafe's timestamp`];
+        if (this.liveStatus) parts.push(`camera ${this.liveStatus} for ${Math.round((Date.now() - this.liveStatusAt) / 1000)}s`);
+        const clip = eventClip(data);
+        if (clip) parts.push(`SimpliSafe clip starts ${typeof clip.preroll === 'number' ? clip.preroll : '?'}s before it`);
+        return parts.join(', ');
+    }
+
+    onCameraStatus(data) {
+        if (!data || data.uuid !== this.id || typeof data.status !== 'string') return;
+        if (data.status === this.liveStatus) return;
+
+        const previous = this.liveStatus;
+        this.liveStatus = data.status;
+        this.liveStatusAt = Date.now();
+        if (this.debug) {
+            const delay = this.eventDelay(data);
+            const status = /^[a-z_]+$/i.test(data.status) ? data.status : '(unknown)';
+            this.log(`'${this.name}' is ${status}${previous ? ` (was ${previous})` : ''}${delay === null ? '' : `, reported ${delay.toFixed(1)}s after the camera's timestamp`}`);
+        }
+    }
+
+    // With the motionTest option, measures how soon video could follow a motion or doorbell event
+    runMotionTest(data, receivedAt) {
+        if (!this.cameraOptions || !this.cameraOptions.motionTest || !this.streamingDelegate) return;
+        this.streamingDelegate.runMotionTest(data, receivedAt).catch(err => {
+            this.log.error(`Motion test for '${this.name}' failed:`, err && err.message);
+        });
+    }
+
     startListening() {
+        this.simplisafe.on(EVENT_TYPES.CAMERA_STATUS, data => this.onCameraStatus(data));
+
         const onMotion = event => (data) => {
             if (!this._validateEvent(event, data)) return;
-            this.lastEventAt = Date.now();
+            const receivedAt = Date.now();
+            this.lastEventAt = receivedAt;
+            if (this.debug) this.log(`Motion: '${this.name}' event arrived ${this.describeEvent(data)}`);
+            this.runMotionTest(data, receivedAt);
             this.accessory.getService(this.api.hap.Service.MotionSensor).updateCharacteristic(this.api.hap.Characteristic.MotionDetected, true);
             this.motionIsTriggered = true;
             setTimeout(() => {
@@ -197,8 +245,12 @@ class SS3Camera extends SimpliSafe3Accessory {
         this.simplisafe.on(EVENT_TYPES.MOTION, onMotion(EVENT_TYPES.MOTION));
         this.simplisafe.on(EVENT_TYPES.DOORBELL, (data) => {
             if (!this._validateEvent(EVENT_TYPES.DOORBELL, data)) return;
-            this.lastEventAt = Date.now();
-            this.accessory.getService(this.api.hap.Service.Doorbell).getCharacteristic(this.api.hap.Characteristic.ProgrammableSwitchEvent).setValue(0);
+            const receivedAt = Date.now();
+            this.lastEventAt = receivedAt;
+            const doorbell = this.accessory.getService(this.api.hap.Service.Doorbell);
+            if (this.debug) this.log(`Doorbell: '${this.name}' pressed, event arrived ${this.describeEvent(data)}${doorbell ? ', notifying HomeKit' : ', but it has no doorbell in HomeKit'}`);
+            if (doorbell) doorbell.getCharacteristic(this.api.hap.Characteristic.ProgrammableSwitchEvent).setValue(0);
+            this.runMotionTest(data, receivedAt);
         });
     }
 

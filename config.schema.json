@@ -59,6 +59,12 @@
             "default": 10,
             "minimum": 1
           },
+          "motionTest": {
+            "title": " Motion Test (temporary)",
+            "description": "For a test session only: after each motion or doorbell event, measure how soon the camera's video arrives and how soon SimpliSafe's own clip of the event can be read, and write the results to the log. Each event wakes a battery camera (at most once a minute per camera). Turn on Debug as well, and turn this off again afterwards.",
+            "type": "boolean",
+            "default": false
+          },
           "enableHwaccelRpi": {
             "title": " Enable Hardware Acceleration for Raspberry Pi",
             "description": "This may not work if you set the path to use a custom build of ffmpeg",
@@ -125,6 +131,7 @@
 			},
       "items": [
         "cameraOptions.batterySnapshotMinutes",
+        "cameraOptions.motionTest",
         "cameraOptions.enableHwaccelRpi",
         "cameraOptions.ffmpegPath",
         "cameraOptions.sourceOptions",

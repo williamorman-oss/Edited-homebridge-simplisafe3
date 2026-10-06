@@ -3,6 +3,7 @@ import axiosRetry from 'axios-retry';
 import WebSocket from 'ws';
 import EventEmitter from 'events';
 import { AUTH_EVENTS } from './lib/authManager';
+import { eventShape } from './lib/diagnosticLines';
 
 export const VALID_ALARM_STATES = [
     'off',
@@ -55,6 +56,8 @@ export const EVENT_TYPES = {
     POWER_OUTAGE: 'POWER_OUTAGE',
     POWER_RESTORED: 'POWER_RESTORED',
     USER_INITIATED_TEST: 'USER_INITIATED_TEST',
+    // a camera woke up, went to sleep, went offline or came back
+    CAMERA_STATUS: 'CAMERA_STATUS',
 };
 
 // Emitted with the alarm system whenever it is fetched, it also carries the cameras' battery and charging state
@@ -632,6 +635,8 @@ class SimpliSafe3 extends EventEmitter {
                         this.loggedCameraStatus = true;
                     } else {
                         this.log(`SSAPI event ${data.eventCid} (${data.eventType}) from sensor type ${data.sensorType} serial ${data.sensorSerial}${data.internal && data.internal.mainCamera ? `, camera ${data.internal.mainCamera}` : ''}`);
+                        // what SimpliSafe records for camera events, e.g. how much of its clip is from before the motion
+                        if (data.video || data.eventCid == 1170 || data.eventCid == 1458) this.log(`SSAPI event ${data.eventCid} shape: ${eventShape(data)}`);
                     }
                 }
 
@@ -647,7 +652,7 @@ class SimpliSafe3 extends EventEmitter {
                     this.emit(EVENT_TYPES.ALARM_OFF, data);
                     break;
                 case 'cameraStatus':
-                    // nothing to do
+                    this.emit(EVENT_TYPES.CAMERA_STATUS, data);
                     break;
                 case 'activity':
                 case 'activityQuiet':

@@ -203,3 +203,63 @@ test('a sleeping battery camera reads as asleep in the logs, not just offline', 
         /^Back Yard: SSOBCM4 via simplisafe, battery 84%, asleep or offline$/);
     assert.match(camera({ model: 'SS002', status: 'offline', supportedFeatures: { wired: true } }).diagnostics(), /status offline$/);
 });
+
+function eventCamera(overrides = {}) {
+    const { EventEmitter } = require('node:events');
+    const lines = [];
+    const log = (...args) => lines.push(args.join(' '));
+    log.error = log;
+    const services = {};
+    const camera = Object.assign(Object.create(SS3Camera.prototype), {
+        id: 'e15534806fb14446be20a948f11a9cfb', name: 'Back Yard', debug: true, log, lines,
+        cameraDetails: { serial: 'f11a9cfb' }, cameraOptions: {},
+        simplisafe: new EventEmitter(),
+        api: { hap: { Service: { MotionSensor: 'motion', Doorbell: 'doorbell' }, Characteristic: { MotionDetected: 'md', ProgrammableSwitchEvent: 'pse' } } },
+        accessory: { getService: (type) => services[type] },
+        services,
+    }, overrides);
+    return camera;
+}
+
+test('camera status changes are logged once per change, with how late SimpliSafe reported them', () => {
+    const camera = eventCamera();
+    const status = (value, uuid = camera.id) => camera.onCameraStatus({ eventType: 'cameraStatus', uuid, sid: 7654321, status: value, eventTimestamp: Date.now() - 3200 });
+
+    status('online');
+    status('online');
+    status('offline', 'another-camera');
+    status('offline');
+
+    assert.equal(camera.lines.length, 2);
+    assert.match(camera.lines[0], /^'Back Yard' is online, reported 3\.\ds after the camera's timestamp$/);
+    assert.match(camera.lines[1], /^'Back Yard' is offline \(was online\)/);
+    assert.ok(!camera.lines.join('\n').includes('7654321'));
+    assert.equal(camera.liveStatus, 'offline');
+});
+
+test('a doorbell press on a camera without a doorbell in HomeKit is logged, not thrown', () => {
+    const camera = eventCamera({ name: 'Front Door' });
+    camera.startListening();
+
+    assert.doesNotThrow(() => camera.simplisafe.emit('DOORBELL', { sensorSerial: 'f11a9cfb', eventTimestamp: Math.floor(Date.now() / 1000) }));
+    assert.ok(camera.lines.some((line) => /Doorbell: 'Front Door' pressed, event arrived about \d+\.\ds after SimpliSafe's timestamp, but it has no doorbell in HomeKit/.test(line)));
+});
+
+test('a motion event is logged with its delay, the camera state and the clip SimpliSafe records, and runs the motion test only when asked', () => {
+    let tests = 0;
+    const camera = eventCamera({ streamingDelegate: { runMotionTest: async () => { tests++; } } });
+    const motion = { setValue() {}, updateCharacteristic() { return this; } };
+    camera.services.motion = motion;
+    camera.liveStatus = 'online';
+    camera.liveStatusAt = Date.now() - 4000;
+    camera.startListening();
+
+    const event = { sensorSerial: 'f11a9cfb', eventTimestamp: Math.floor(Date.now() / 1000) - 5, videoStartedBy: 'x', video: { x: { preroll: 3 } } };
+    camera.simplisafe.emit('CAMERA_MOTION', event);
+    assert.match(camera.lines.find((line) => line.startsWith('Motion:')), /^Motion: 'Back Yard' event arrived about \d+\.\ds after SimpliSafe's timestamp, camera online for 4s, SimpliSafe clip starts 3s before it$/);
+    assert.equal(tests, 0);
+
+    camera.cameraOptions = { motionTest: true };
+    camera.simplisafe.emit('CAMERA_MOTION', event);
+    assert.equal(tests, 1);
+});
