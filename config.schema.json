@@ -59,6 +59,18 @@
             "default": 10,
             "minimum": 1
           },
+          "record": {
+            "title": "Record in HomeKit (HomeKit Secure Video)",
+            "description": "Names of the cameras HomeKit may record, as shown in the SimpliSafe app. Then choose 'Stream & Allow Recording' for each in the Home app. Needs a home hub and iCloud+.",
+            "type": "array",
+            "items": { "type": "string", "title": "Camera name" }
+          },
+          "alwaysConnected": {
+            "title": "Always Connected (plugged-in cameras only)",
+            "description": "Of the recording cameras, those to keep streaming all the time, so a recording starts with the seconds before the motion. SimpliSafe reports motion 4-8 seconds late, so without this a recording starts after the motion began. Uses about 2 Mbps per Outdoor Camera, all the time. Remove a camera to stop.",
+            "type": "array",
+            "items": { "type": "string", "title": "Camera name" }
+          },
           "eventImages": {
             "title": " Use SimpliSafe's Event Images for Notifications",
             "description": "For Outdoor Cameras, a motion or doorbell notification shows SimpliSafe's own image of the event when it is ready within 3 seconds (usually under 1), instead of waking the camera for a new one.",
@@ -136,6 +148,8 @@
 				"functionBody": "return (model.cameras || model.camerasOnly)"
 			},
       "items": [
+        "cameraOptions.record",
+        "cameraOptions.alwaysConnected",
         "cameraOptions.batterySnapshotMinutes",
         "cameraOptions.eventImages",
         "cameraOptions.motionTest",

@@ -434,7 +434,7 @@ class SS3Platform {
                             this.simplisafe,
                             this.authManager,
                             this.api,
-                            { snapshotDir: this.snapshotDir }
+                            { snapshotDir: this.snapshotDir, recording: this.recordingFor(cameraName) }
                         );
                         if (cameraAccessory.isUnsupported()) this.log.warn(`Detected unsupported camera ${cameraName}, some features will be disabled.`);
 
@@ -452,6 +452,14 @@ class SS3Platform {
             throw err;
         }
 
+    }
+
+    // HomeKit Secure Video is switched on per camera, by name, in cameraOptions.record and alwaysConnected
+    recordingFor(cameraName) {
+        const options = this.cameraOptions || {};
+        const listed = list => (Array.isArray(list) ? list : []).some(name => String(name).trim().toLowerCase() === cameraName.trim().toLowerCase());
+        const enabled = listed(options.record);
+        return { enabled, alwaysConnected: enabled && listed(options.alwaysConnected) };
     }
 
     updateAccessoriesReachability() {

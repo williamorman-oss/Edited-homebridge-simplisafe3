@@ -34,7 +34,7 @@ plugin({
     registerPlatform: (pluginName, platformName, constructor) => { SS3Platform = constructor; },
 });
 
-function createPlatform({ camerasOnly = false } = {}) {
+function createPlatform({ camerasOnly = false, cameraOptions } = {}) {
     const warnings = [];
     const log = () => {};
     log.error = () => {};
@@ -49,7 +49,7 @@ function createPlatform({ camerasOnly = false } = {}) {
         excludedDevices: [],
         devices: [],
         accessories: [],
-        cameraOptions: null,
+        cameraOptions: cameraOptions || null,
         authManager: {},
         api: {},
         snapshotDir: '/tmp/snapshots',
@@ -80,7 +80,16 @@ test('camerasOnly discovers just the cameras', async () => {
     await ctx.discoverSimpliSafeDevices();
 
     assert.deepEqual(ctx.devices.map((device) => device.kind), ['camera']);
-    assert.deepEqual(ctx.devices[0].args.at(-1), { snapshotDir: '/tmp/snapshots' });
+    assert.deepEqual(ctx.devices[0].args.at(-1), { snapshotDir: '/tmp/snapshots', recording: { enabled: false, alwaysConnected: false } });
+});
+
+test('recording is switched on per camera by name, and always connected only for cameras that record', async () => {
+    const { ctx } = createPlatform({ camerasOnly: true, cameraOptions: { record: [' side yard ', 'Front Door'], alwaysConnected: ['Side Yard', 'Back Yard'] } });
+    await ctx.discoverSimpliSafeDevices();
+    assert.deepEqual(ctx.devices[0].args.at(-1).recording, { enabled: true, alwaysConnected: true });
+
+    assert.deepEqual(ctx.recordingFor('Back Yard'), { enabled: false, alwaysConnected: false }, 'always connected alone does not record');
+    assert.deepEqual(ctx.recordingFor('Front Door'), { enabled: true, alwaysConnected: false });
 });
 
 test('camera details from a system refresh reach the camera', async () => {

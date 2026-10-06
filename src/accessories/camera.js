@@ -9,6 +9,9 @@ import StreamingDelegate from '../lib/streamingDelegate';
 import { eventClip, eventTime } from '../lib/diagnosticLines';
 
 const lowBatteryLevel = 20; // %
+const motionHold = 5000; // ms MotionDetected stays on after the last motion event
+// HomeKit records while the motion sensor is on, and SimpliSafe repeats events during long motion every 25-70s
+const recordingMotionHold = 20000; // ms
 
 class SS3Camera extends SimpliSafe3Accessory {
     constructor(name, id, cameraDetails, cameraOptions, log, debug, simplisafe, authManager, api, platformOptions = {}) {
@@ -24,6 +27,9 @@ class SS3Camera extends SimpliSafe3Accessory {
         this.liveStatusAt = 0;
         // the last snapshot is kept on disk so tiles have an image straight after a restart
         if (platformOptions.snapshotDir) this.snapshotPath = path.join(platformOptions.snapshotDir, `${id}.jpg`);
+        this.recordingOptions = platformOptions.recording || {};
+        this.recording = null;
+        this.motionTimer = null;
 
         this.ffmpegPath = isDocker() ? 'ffmpeg' : ffmpegPath;
         if (this.debug && isDocker()) this.log('Detected running in docker, initializing with docker-bundled ffmpeg');
@@ -51,9 +57,19 @@ class SS3Camera extends SimpliSafe3Accessory {
             .setCharacteristic(this.api.hap.Characteristic.SerialNumber, this.id)
             .setCharacteristic(this.api.hap.Characteristic.FirmwareRevision, this.cameraDetails.cameraSettings.admin.firmwareVersion);
 
+        // HomeKit Secure Video records on the camera's own motion sensor, so it has to exist first
+        if (this.recordingOptions.enabled && !this.isUnsupported()) {
+            if (!this.accessory.getService(this.api.hap.Service.MotionSensor)) this.accessory.addService(this.api.hap.Service.MotionSensor);
+            this.recording = this.streamingDelegate.enableRecording({
+                motionService: this.accessory.getService(this.api.hap.Service.MotionSensor),
+                alwaysConnected: !!this.recordingOptions.alwaysConnected
+            });
+            this.controller = this.streamingDelegate.controller;
+            if (this.recording) this.log(`'${this.name}' records in HomeKit${this.recordingOptions.alwaysConnected ? ', always connected' : ''} once 'Stream & Allow Recording' is chosen for it in the Home app`);
+        }
+
         this.accessory.configureController(this.controller);
 
-        // add motion sensor after configureController as HKSV creates it own linked motion service
         if (!this.accessory.getService(this.api.hap.Service.MotionSensor)) this.accessory.addService(this.api.hap.Service.MotionSensor);
         this.accessory.getService(this.api.hap.Service.MotionSensor)
             .getCharacteristic(this.api.hap.Characteristic.MotionDetected)
@@ -237,13 +253,10 @@ class SS3Camera extends SimpliSafe3Accessory {
             this.lastEventAt = receivedAt;
             if (this.debug) this.log(`Motion: '${this.name}' event arrived ${this.describeEvent(data)}`);
             if (this.streamingDelegate && this.streamingDelegate.noteEvent) this.streamingDelegate.noteEvent(data, receivedAt);
+            // the camera is started before HomeKit hears of the motion and asks for a recording
+            if (this.recording) this.recording.prepare();
             this.runMotionTest(data, receivedAt);
-            this.accessory.getService(this.api.hap.Service.MotionSensor).updateCharacteristic(this.api.hap.Characteristic.MotionDetected, true);
-            this.motionIsTriggered = true;
-            setTimeout(() => {
-                this.accessory.getService(this.api.hap.Service.MotionSensor).updateCharacteristic(this.api.hap.Characteristic.MotionDetected, false);
-                this.motionIsTriggered = false;
-            }, 5000);
+            this.motionDetected();
         };
         this.simplisafe.on(EVENT_TYPES.CAMERA_MOTION, onMotion(EVENT_TYPES.CAMERA_MOTION));
         // cameras paired to the base station (e.g. Outdoor Camera) may report motion like a sensor, matched by serial below
@@ -255,9 +268,25 @@ class SS3Camera extends SimpliSafe3Accessory {
             const doorbell = this.accessory.getService(this.api.hap.Service.Doorbell);
             if (this.debug) this.log(`Doorbell: '${this.name}' pressed, event arrived ${this.describeEvent(data)}${doorbell ? ', notifying HomeKit' : ', but it has no doorbell in HomeKit'}`);
             if (this.streamingDelegate && this.streamingDelegate.noteEvent) this.streamingDelegate.noteEvent(data, receivedAt);
+            if (this.recording) this.recording.prepare();
             if (doorbell) doorbell.getCharacteristic(this.api.hap.Characteristic.ProgrammableSwitchEvent).setValue(0);
             this.runMotionTest(data, receivedAt);
+            // HomeKit hubs never record on a doorbell press, someone at the door is motion too
+            if (this.recording) this.motionDetected();
         });
+    }
+
+    // Turns the motion sensor on, and off again once events stop for a while. A new event keeps it on
+    motionDetected() {
+        const service = this.accessory.getService(this.api.hap.Service.MotionSensor);
+        if (!service) return;
+        service.updateCharacteristic(this.api.hap.Characteristic.MotionDetected, true);
+        this.motionIsTriggered = true;
+        clearTimeout(this.motionTimer);
+        this.motionTimer = setTimeout(() => {
+            service.updateCharacteristic(this.api.hap.Characteristic.MotionDetected, false);
+            this.motionIsTriggered = false;
+        }, this.recording ? recordingMotionHold : motionHold);
     }
 
     _validateEvent(event, data) {

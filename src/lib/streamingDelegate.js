@@ -17,6 +17,8 @@ import { applyFfmpegOptions, flattenFfmpegArgs, redactFfmpegArgs } from './ffmpe
 import { eventClip, opusPacketDuration, simplisafeUrl, linkName } from './diagnosticLines';
 import { probeClip, httpGet, domainOf, isSimpliSafeHost } from './clipProbe';
 import { OpusRepacker } from './opus';
+import { recordingOptions, LiveKitRecordingSource, FlvRecordingSource } from './recording';
+import RecordingDelegate from './recordingDelegate';
 
 const dnsLookup = promisify(dns.lookup);
 
@@ -175,13 +177,66 @@ class StreamingDelegate {
         let maxSupportedHeight = +(resolution.split('p')[0]);
         streamingOptions.video.resolutions = streamingOptions.video.resolutions.filter(r => r[1] <= maxSupportedHeight);
 
-        const cameraController = new this.api.hap.CameraController({
+        this.streamingOptions = streamingOptions;
+        this.controller = new this.api.hap.CameraController({
             cameraStreamCount: 2,
             delegate: this,
             streamingOptions: streamingOptions
         });
+    }
 
-        this.controller = cameraController;
+    // Replaces the controller with one that also records for HomeKit Secure Video. The camera's motion
+    // sensor triggers recordings, so the existing service is passed in: HAP would otherwise make a second
+    // one on a cached accessory that is never shown. Returns the recording delegate, or null if HAP is too old
+    enableRecording({ motionService, alwaysConnected }) {
+        const hap = this.api.hap;
+        if (!hap.AudioRecordingCodecType || !hap.MediaContainerType || !hap.HDSProtocolError) {
+            this.log.warn(`HomeKit Secure Video needs a newer Homebridge, '${this.ss3Camera.name}' will not record`);
+            return null;
+        }
+
+        const recording = new RecordingDelegate({
+            name: this.ss3Camera.name,
+            log: this.log,
+            debug: this.ss3Camera.debug,
+            hap: hap,
+            alwaysConnected: alwaysConnected,
+            // a battery camera is kept awake for the whole recording
+            maxDuration: this.ss3Camera.isBatteryPowered() && !this.ss3Camera.isCharging() ? 60000 : 180000,
+            createSource: options => this.createRecordingSource(options),
+            audioActive: () => this.recordingAudioActive(),
+            allowed: async () => !(await this.isPrivacyShutterClosed(true))
+        });
+        this.recording = recording;
+        this.controller = new hap.CameraController({
+            cameraStreamCount: 2,
+            delegate: this,
+            streamingOptions: this.streamingOptions,
+            recording: { options: recordingOptions(hap), delegate: recording },
+            sensors: { motion: motionService }
+        });
+        return recording;
+    }
+
+    // The Home app's 'record audio' setting
+    recordingAudioActive() {
+        const management = this.controller && this.controller.recordingManagement;
+        if (!management) return true;
+        return !!management.recordingManagementService.getCharacteristic(this.api.hap.Characteristic.RecordingAudioActive).value;
+    }
+
+    createRecordingSource({ audio }) {
+        const options = { name: this.ss3Camera.name, log: this.log, debug: this.ss3Camera.debug, ffmpegPath: this.ss3Camera.ffmpegPath, audio: audio };
+        if (this.ss3Camera.getStreamProvider() === 'livekit') {
+            return new LiveKitRecordingSource(options, {
+                acquire: () => this.acquireLiveKitSource(),
+                release: lease => this.releaseLiveKitSource(lease)
+            }).start();
+        }
+        return new FlvRecordingSource(options, {
+            uuid: this.cameraDetails.uuid,
+            accessToken: () => this.ss3Camera.authManager.accessToken
+        }).start();
     }
 
     diagnostics() {
@@ -238,8 +293,10 @@ class StreamingDelegate {
 
     // SimpliCams close their privacy shutter depending on the alarm state. Unless the shutter is known to be
     // open, neither show a cached image nor ask the camera, which could open the shutter
-    async isPrivacyShutterClosed() {
-        if (this.ss3Camera.motionIsTriggered || !this.ss3Camera.supportsPrivacyShutter()) return false;
+    // A recording asks with ignoreMotion: motion is exactly when it starts, and the shutter may still be closed
+    async isPrivacyShutterClosed(ignoreMotion = false) {
+        if (!this.ss3Camera.supportsPrivacyShutter()) return false;
+        if (this.ss3Camera.motionIsTriggered && !ignoreMotion) return false;
 
         const settings = this.cameraDetails.cameraSettings;
         const open = setting => setting === 'open';

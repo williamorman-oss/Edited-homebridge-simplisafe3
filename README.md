@@ -169,6 +169,18 @@ Only the SimpliCam, Video Doorbell Pro and Video Doorbell Series 2 have been tes
 #### Snapshots
 HomeKit sends a bridge's requests one at a time: camera snapshots, starting a live view, and alarm and lock commands all wait for the request before them. Fetching a new snapshot takes a few seconds (longer if a battery camera has to wake up), so the plugin answers snapshot requests straight away with the most recent image and refreshes it in the background. Tiles in the Home app may therefore show an image that is a few seconds old (a few minutes for battery cameras). Doorbell and motion notifications always wait briefly for a new image. For Outdoor Cameras that image is SimpliSafe's own image of the event when it is ready within 3 seconds (usually under 1), which saves waking the camera; set `eventImages` to `false` to always ask the camera instead. The last image of each camera is kept on disk so tiles show something straight after a restart.
 
+#### Recording (HomeKit Secure Video)
+HomeKit can record cameras listed in `record` (Advanced Camera Settings), by the names used in the SimpliSafe app. After restarting Homebridge, choose **Stream & Allow Recording** for each of them in the Home app. This needs a home hub (Apple TV or HomePod) and an iCloud+ plan: 50 GB covers one camera, 200 GB five, 2 TB any number. The cameras stay paired, recording is added to them; remove a camera from the list to take recording away again.
+
+SimpliSafe reports motion to the plugin 4-8 seconds after it happens. A recording therefore normally starts a few seconds after the motion began: the camera is woken (or joined, if already awake) when SimpliSafe's event arrives, and its video goes to HomeKit as it is, with audio converted to AAC. Cameras that are plugged in can be listed in `alwaysConnected` as well: the plugin then keeps them streaming and holds the last few seconds, so a recording starts with the moments before SimpliSafe's event. That uses about 2 Mbps per Outdoor Camera all the time (roughly 650 GB a month); remove the camera from the list to stop. Battery cameras record for at most a minute each time, others up to three minutes. The SimpliCam only records while its privacy shutter is open for the alarm state.
+
+```
+"cameraOptions": {
+    "record": ["Front Door", "Side Yard", "Back Yard"],
+    "alwaysConnected": ["Side Yard"]
+}
+```
+
 #### Battery cameras
 Battery cameras such as the Outdoor Camera sleep between events, and every snapshot or live view wakes them, which takes 5-10 seconds and uses battery. A live view opened while the camera is being woken for a snapshot, or a second viewer, shares that connection instead of waking it again, and the connection closes as soon as nothing uses it. While a battery camera is not charging its snapshot is only refreshed when it is more than `batterySnapshotMinutes` (default `10`) old, or for a motion notification. Cameras that are plugged in or charging from a solar panel refresh every minute. If a camera does not respond (e.g. its battery is empty) the plugin shows a placeholder image and waits longer and longer between attempts. Battery cameras also report their battery level and charging state to HomeKit.
 
