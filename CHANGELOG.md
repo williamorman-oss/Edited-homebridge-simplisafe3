@@ -1,7 +1,12 @@
 # Change Log
 All notable changes are documented here.
 
-## Unreleased
+## 1.12.0-beta.3, homebridge-simplisafe3-edited (2026-10-06)
+Install, or update an earlier beta, next to the original plugin (see the README):
+```
+npm install --prefix /var/lib/homebridge https://github.com/williamorman-oss/Edited-homebridge-simplisafe3/raw/1de3d4f4516e9a63561347d2576c8523d954070d/releases/homebridge-simplisafe3-edited-1.12.0-beta.3.tgz
+```
+
 - 'Logs for Claude' card in the plugin's settings: recent log lines with passwords, tokens, email addresses, MAC addresses, Wi-Fi names and account numbers removed, and a button to copy them. Nothing is sent anywhere
 - Debug logs now give live view and snapshot timings
 
