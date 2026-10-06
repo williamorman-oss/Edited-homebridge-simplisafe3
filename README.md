@@ -21,11 +21,11 @@ This is a fork of [homebridge-simplisafe3](https://github.com/homebridge-simplis
 - by default it only adds cameras (`camerasOnly`), so the alarm, sensors and locks stay with the original plugin
 
 ### Installing alongside the original
-1. In the Homebridge UI open the terminal (top right menu, **Terminal**) and run:
+1. In the Homebridge UI open the terminal (top right menu, **Terminal**) and run the install command listed for the latest release in the [change log](CHANGELOG.md). It looks like this:
    ```
-   npm install --prefix /var/lib/homebridge https://github.com/williamorman-oss/Edited-homebridge-simplisafe3/raw/edited-1.12.0-beta.2/releases/homebridge-simplisafe3-edited-1.12.0-beta.2.tgz
+   npm install --prefix /var/lib/homebridge https://github.com/williamorman-oss/Edited-homebridge-simplisafe3/raw/<commit>/releases/homebridge-simplisafe3-edited-<version>.tgz
    ```
-   Use your Homebridge storage folder if it is not `/var/lib/homebridge` (e.g. `/homebridge` in Docker). The link points at a tagged release that never changes. npm records it in the storage folder's `package.json`, so it has to stay available.
+   Use your Homebridge storage folder if it is not `/var/lib/homebridge` (e.g. `/homebridge` in Docker). Each release's link points at a fixed commit, so it never changes. npm records it in the storage folder's `package.json`, so it has to stay available.
 2. Restart Homebridge. **SimpliSafe 3 (Edited)** appears under Plugins.
 3. Open its settings and log in to SimpliSafe (this is a separate login from the original plugin). The name you give it (default `SimpliSafe Cameras`) is what its log lines start with. Save.
 4. Under the plugin's **Bridge Settings**, turn on the child bridge and restart Homebridge.
