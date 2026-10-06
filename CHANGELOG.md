@@ -1,7 +1,12 @@
 # Change Log
 All notable changes are documented here.
 
-## Unreleased
+## 1.12.0-beta.2, homebridge-simplisafe3-edited (2026-10-06)
+Install next to the original plugin (see the README):
+```
+npm install --prefix /var/lib/homebridge https://github.com/williamorman-oss/Edited-homebridge-simplisafe3/raw/d8f6173c8f336d74e76a0134c8cd7cc0203a6153/releases/homebridge-simplisafe3-edited-1.12.0-beta.2.tgz
+```
+
 - Snapshots are answered straight away from the latest image and refreshed in the background. HomeKit sends a bridge's requests one at a time, so a slow or offline camera used to hold up every other camera, live view and the alarm
 - Faster live view for the SimpliCam and Video Doorbell Pro: video starts about 2 seconds sooner and no longer runs about 2 seconds behind
 - Outdoor Camera: battery level and charging state in HomeKit, less frequent snapshots while on battery (`batterySnapshotMinutes`), placeholder and back-off for cameras that do not respond, no more "Sensor not (yet) supported" warnings
