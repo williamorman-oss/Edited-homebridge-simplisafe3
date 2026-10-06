@@ -299,6 +299,14 @@ export class FlvRecordingSource extends RecordingSource {
                 if (this.audio) output.push('-map', '0:a:0?', '-c:a', 'copy');
                 else output.push('-an');
                 const cmd = this.spawnFfmpeg(['-fpsprobesize', '0', '-f', 'flv', '-i', 'pipe:0'], output);
+                // what keeping this camera connected all the time would cost
+                const openedAt = Date.now();
+                let bytes = 0;
+                res.on('data', chunk => { bytes += chunk.length; });
+                this.once('end', () => {
+                    const seconds = (Date.now() - openedAt) / 1000;
+                    if (this.debug && seconds >= 5) this.log(`Recording source for '${this.name}' received ${Math.round(bytes * 8 / seconds / 1000)} kbps over ${Math.round(seconds)}s`);
+                });
                 // when the stream ends, ffmpeg finishes what it was given and stops on its own
                 res.pipe(cmd.stdin);
                 res.on('error', () => this.end('the stream was interrupted'));

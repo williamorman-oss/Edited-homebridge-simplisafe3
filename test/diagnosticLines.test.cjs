@@ -123,3 +123,18 @@ test('ffmpeg stream descriptions come from the input only, not repeated for the 
     ].join('\n');
     assert.deepEqual(ffmpegStreams(stderr), ['video h264 (Main), yuv420p, 1920x1080, 20 fps', 'audio aac (LC), 16000 Hz, mono']);
 });
+
+test('a camera\'s video track lists the qualities a viewer could choose between', () => {
+    const p = require('@livekit/protocol');
+    const { participants } = require('../dist/lib/diagnosticLines');
+    const line = participants([new p.ParticipantInfo({ identity: 'camera-x', state: p.ParticipantInfo_State.ACTIVE, isPublisher: true, tracks: [
+        new p.TrackInfo({ type: p.TrackType.VIDEO, source: p.TrackSource.CAMERA, mimeType: 'video/H264', simulcast: true, layers: [
+            new p.VideoLayer({ quality: p.VideoQuality.LOW, width: 480, height: 270, bitrate: 150000, ssrc: 1234567 }),
+            new p.VideoLayer({ quality: p.VideoQuality.HIGH, width: 1920, height: 1080, bitrate: 2000000 }),
+        ] }),
+        new p.TrackInfo({ type: p.TrackType.AUDIO, source: p.TrackSource.MICROPHONE, mimeType: 'audio/opus' }),
+    ] })]);
+
+    assert.equal(line, 'STANDARD/ACTIVE publisher [VIDEO/CAMERA video/H264 simulcast layers LOW 480x270 150kbps/HIGH 1920x1080 2000kbps, AUDIO/MICROPHONE audio/opus]');
+    assert.ok(!line.includes('1234567') && !line.includes('camera-x'));
+});

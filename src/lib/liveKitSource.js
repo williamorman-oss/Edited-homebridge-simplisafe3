@@ -38,6 +38,8 @@ class LiveKitSource extends EventEmitter {
 
         // what the camera sends, logged once per connection
         this.videoFormat = null;
+        this.videoBytes = 0;
+        this.videoStartedAt = null;
         this.keyframeTimestamps = [];
         this.lastKeyframeTimestamp = null;
         this.loggedSignals = new Set();
@@ -242,6 +244,8 @@ class LiveKitSource extends EventEmitter {
                 if (track.kind === 'video') {
                     this.streaming = true;
                     this.videoSsrc = rtp.header.ssrc;
+                    if (this.videoStartedAt === null) this.videoStartedAt = Date.now();
+                    this.videoBytes += rtp.payload ? rtp.payload.length : 0;
                     this._watchVideo(rtp);
                     if (this._onFirstVideo) {
                         const notify = this._onFirstVideo;
@@ -342,6 +346,9 @@ class LiveKitSource extends EventEmitter {
 
         // a connection too short to log the keyframe spacing still says what the camera sent
         if (this.debug && this.streaming && this.keyframeTimestamps.length < 4) this.log(`LiveKit: ${this.ss3Camera.name} video ${this._videoDescription()}`);
+        // what keeping this camera connected all the time would cost
+        const seconds = this.videoStartedAt === null ? 0 : (Date.now() - this.videoStartedAt) / 1000;
+        if (this.debug && seconds >= 5) this.log(`LiveKit: ${this.ss3Camera.name} sent ${Math.round(this.videoBytes * 8 / seconds / 1000)} kbps of video over ${Math.round(seconds)}s`);
 
         clearInterval(this.pingIntervalID);
         clearTimeout(this.keyframeRequestID);

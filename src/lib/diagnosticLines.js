@@ -1,4 +1,5 @@
 import {
+    VideoQuality,
     TrackSource,
     TrackType,
     ParticipantInfo_Kind,
@@ -102,7 +103,11 @@ export function participants(list) {
     return (list || []).map(participant => {
         const tracks = (participant.tracks || []).map(track => {
             const size = track.width && track.height ? ` ${number(track.width)}x${number(track.height)}` : '';
-            return `${enumName(TrackType, track.type)}/${enumName(TrackSource, track.source)} ${token(track.mimeType)}${size}${track.muted ? ' muted' : ''}`;
+            // the qualities a viewer can choose between, if the camera sends more than one
+            const layers = (track.layers || []).map(layer =>
+                `${enumName(VideoQuality, layer.quality)} ${number(layer.width)}x${number(layer.height)} ${typeof layer.bitrate === 'number' && layer.bitrate ? `${Math.round(layer.bitrate / 1000)}kbps` : '?kbps'}`);
+            const quality = track.type === TrackType.VIDEO ? `${track.simulcast ? ' simulcast' : ''}${layers.length ? ` layers ${layers.join('/')}` : ''}` : '';
+            return `${enumName(TrackType, track.type)}/${enumName(TrackSource, track.source)} ${token(track.mimeType)}${size}${quality}${track.muted ? ' muted' : ''}`;
         });
         return `${enumName(ParticipantInfo_Kind, participant.kind)}/${enumName(ParticipantInfo_State, participant.state)}${participant.isPublisher ? ' publisher' : ''} [${tracks.join(', ')}]`;
     }).join('; ') || 'none';
