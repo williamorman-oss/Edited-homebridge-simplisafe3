@@ -78,7 +78,7 @@ const rateLimitMaxInterval = 2 * 60 * 60 * 1000; // ms
 const sensorRefreshLockoutDuration = 20000; // ms
 const errorSuppressionDuration = 5 * 60 * 1000; // ms
 const alarmRefreshInterval = 62000; // ms, avoid overlap with sensor refresh
-const alarmStateMaxAge = 60000; // ms a known alarm state is used without asking SimpliSafe again
+const alarmStateTrustTime = 10000; // ms an alarm state is relied on for the privacy shutter before asking again
 const apiTimeout = 30000; // ms
 const appHubTimeout = 15000; // ms
 
@@ -130,6 +130,7 @@ class SimpliSafe3 extends EventEmitter {
     nextAttempt = 0;
     lastAlarmState = null;
     lastAlarmStateAt = 0;
+    lastAlarmEventAt = 0;
     alarmStateRefresh = null;
 
     constructor(sensorRefreshTime = 15000, authManager, storagePath, log, debug) {
@@ -152,10 +153,11 @@ class SimpliSafe3 extends EventEmitter {
         this.trackAlarmState();
     }
 
-    // Keeps the alarm state from realtime events, mirroring the alarm accessory, so camera snapshots can
-    // decide on the privacy shutter without a request
+    // Keeps the alarm state from realtime events so camera snapshots can decide on the privacy shutter.
+    // An arm or disarm event from a source the state can't be read from clears it, so it is asked for again
     trackAlarmState() {
-        const fromControl = data => data && [SENSOR_TYPES.APP, SENSOR_TYPES.KEYPAD, SENSOR_TYPES.KEYCHAIN, SENSOR_TYPES.DOORLOCK].includes(data.sensorType);
+        const controls = [SENSOR_TYPES.APP, SENSOR_TYPES.KEYPAD, SENSOR_TYPES.KEYCHAIN, SENSOR_TYPES.DOORLOCK, SENSOR_TYPES.DOORLOCK_2];
+        const fromControl = data => data && controls.includes(Number(data.sensorType));
         const states = {
             [EVENT_TYPES.ALARM_DISARM]: 'OFF',
             [EVENT_TYPES.ALARM_CANCEL]: 'OFF',
@@ -167,38 +169,47 @@ class SimpliSafe3 extends EventEmitter {
         };
         for (const [event, state] of Object.entries(states)) {
             this.on(event, data => {
-                if (fromControl(data)) this.recordAlarmState(state);
+                if (fromControl(data)) this.recordAlarmState(state, Date.now(), true);
+                else this.forgetAlarmState();
             });
         }
-        this.on(EVENT_TYPES.ALARM_TRIGGER, () => this.recordAlarmState('ALARM'));
+        this.on(EVENT_TYPES.ALARM_TRIGGER, () => this.recordAlarmState('ALARM', Date.now(), true));
     }
 
-    recordAlarmState(state) {
+    // observedAt is when the state was true, an API reply never overrides a newer event
+    recordAlarmState(state, observedAt = Date.now(), fromEvent = false) {
         if (!state) return;
+        if (fromEvent) this.lastAlarmEventAt = observedAt;
+        else if (observedAt < this.lastAlarmEventAt) return;
         this.lastAlarmState = state;
-        this.lastAlarmStateAt = Date.now();
+        this.lastAlarmStateAt = observedAt;
     }
 
-    // The alarm state if it is known, without waiting on SimpliSafe when an older one can be used.
-    // Resolves null if it cannot be found within timeout ms
-    async getRecentAlarmState(timeout = 3000) {
-        if (this.lastAlarmState && Date.now() - this.lastAlarmStateAt < alarmStateMaxAge) return this.lastAlarmState;
+    forgetAlarmState() {
+        this.lastAlarmState = null;
+        this.lastAlarmStateAt = 0;
+        this.lastAlarmEventAt = Date.now();
+    }
+
+    // The current alarm state, asking SimpliSafe unless it was seen in the last few seconds.
+    // Resolves null if it cannot be found within timeout ms, it never falls back to an older state
+    async getCurrentAlarmState(timeout = 3000) {
+        const trusted = () => this.lastAlarmState && Date.now() - this.lastAlarmStateAt < alarmStateTrustTime ? this.lastAlarmState : null;
+        if (trusted()) return trusted();
 
         if (!this.alarmStateRefresh) {
             this.alarmStateRefresh = this.getAlarmSystem()
-                .then(system => system.alarmState)
                 .finally(() => { this.alarmStateRefresh = null; });
             this.alarmStateRefresh.catch(() => {});
         }
 
-        if (this.lastAlarmState) return this.lastAlarmState; // refreshed for next time
-
         let timeoutID;
         try {
-            return await Promise.race([
+            await Promise.race([
                 this.alarmStateRefresh,
-                new Promise(resolve => { timeoutID = setTimeout(() => resolve(null), timeout); })
+                new Promise(resolve => { timeoutID = setTimeout(resolve, timeout); })
             ]);
+            return trusted();
         } catch (err) {
             return null;
         } finally {
@@ -211,10 +222,11 @@ class SimpliSafe3 extends EventEmitter {
         this.nextBlockInterval = rateLimitInitialInterval;
     }
 
-    setRateLimitHandler() {
+    // grow is false for timeouts, which are not a sign of being rate limited
+    setRateLimitHandler(grow = true) {
         this.isBlocked = true;
-        this.nextAttempt = Date.now() + this.nextBlockInterval;
-        if (this.nextBlockInterval < rateLimitMaxInterval) {
+        this.nextAttempt = Date.now() + (grow ? this.nextBlockInterval : rateLimitInitialInterval);
+        if (grow && this.nextBlockInterval < rateLimitMaxInterval) {
             this.nextBlockInterval = this.nextBlockInterval * 2;
         }
     }
@@ -252,8 +264,9 @@ class SimpliSafe3 extends EventEmitter {
         } catch (err) {
             if (!err.response) {
                 let rateLimitError = new RateLimitError(err);
-                this.log.error('SSAPI request failed, request blocked (rate limit or auth failure?).');
-                this.setRateLimitHandler();
+                const timedOut = err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT';
+                this.log.error(timedOut ? 'SSAPI request timed out, retrying later.' : 'SSAPI request failed, request blocked (rate limit or auth failure?).');
+                this.setRateLimitHandler(!timedOut);
                 throw rateLimitError;
             }
 
@@ -354,11 +367,13 @@ class SimpliSafe3 extends EventEmitter {
     }
 
     async getAlarmSystem(forceRefresh = false) {
+        // a cached subscription can be up to subscriptionCacheTime older than this request
+        let requestedAt = Date.now() - (forceRefresh ? 0 : subscriptionCacheTime);
         let subscription = await this.getSubscription(forceRefresh);
 
         if (subscription.location && subscription.location.system) {
             let system = subscription.location.system;
-            this.recordAlarmState(system.alarmState);
+            this.recordAlarmState(system.alarmState, requestedAt);
             this.emit(SYSTEM_UPDATED, system);
             return system;
         } else {

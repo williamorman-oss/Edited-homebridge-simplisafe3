@@ -20,7 +20,7 @@
         Also note that this process cannot be performed on a mobile device.
       </p>
       <p class="form-text small">
-        See <a target='_blank' href='https://github.com/homebridge-simplisafe3/homebridge-simplisafe3/blob/master/README.md#simplisafe-authentication'>README</a> for more information.
+        See <a target='_blank' href='https://github.com/williamorman-oss/Edited-homebridge-simplisafe3/blob/master/README.md#simplisafe-authentication'>README</a> for more information.
       </p>
       <a href="" target="_blank" id="ss-login-button" class="btn btn-primary btn-lg disabled">Launch SimpliSafe Login</a>
       <div id="redirect-url" class="text-left">
@@ -59,7 +59,7 @@ $.fn.slideUpFadeOut = function(speed) {
   // get the current homebridge config
   const pluginConfig = await homebridge.getPluginConfig();
   if (!pluginConfig.length) {
-      pluginConfig.push({ name: 'Home Alarm' });
+      pluginConfig.push({ name: 'SimpliSafe Cameras', cameras: true, camerasOnly: true });
       await homebridge.updatePluginConfig(pluginConfig);
   }
 

@@ -26,7 +26,7 @@ function createApiStub() {
 
 function createCameraStub(overrides = {}) {
     return {
-        simplisafe: { isBlocked: false, nextAttempt: 0, getRecentAlarmState: async () => 'OFF' },
+        simplisafe: { isBlocked: false, nextAttempt: 0, getCurrentAlarmState: async () => 'OFF' },
         log: (() => {
             const fn = () => {};
             fn.error = () => {};
@@ -110,22 +110,60 @@ test('a stale snapshot is served at once and refreshed in the background', async
     assert.equal(delegate.snapshots.image.toString(), 'new');
 });
 
-test('a notification snapshot waits for a new image', async () => {
+test('a notification snapshot waits for a new image unless the cached one is only seconds old', async () => {
     const delegate = new StreamingDelegate(createCameraStub());
-    delegate.fetchLegacySnapshot = () => new Promise((resolve) => setTimeout(() => resolve(Buffer.from('new')), 20));
-    delegate.snapshots.set(Buffer.from('cached'));
+    let fetched = 0;
+    delegate.fetchLegacySnapshot = () => new Promise((resolve) => setTimeout(() => resolve(Buffer.from(`new-${++fetched}`)), 20));
+    delegate.snapshots.set(Buffer.from('cached'), Date.now() - 20000);
 
     const args = await requestSnapshot(delegate, { width: 1280, height: 720, reason: 1 });
-    assert.equal(args[1].toString(), 'new');
+    assert.equal(args[1].toString(), 'new-1');
+
+    const again = await requestSnapshot(delegate, { width: 1280, height: 720, reason: 1 });
+    assert.equal(again[1].toString(), 'new-1');
+    assert.equal(fetched, 1);
 });
 
-test('a snapshot shortly after motion waits for a new image', async () => {
-    const delegate = new StreamingDelegate(createCameraStub({ lastEventAt: Date.now() }));
-    delegate.fetchLegacySnapshot = async () => Buffer.from('new');
-    delegate.snapshots.set(Buffer.from('cached'));
+test('after motion only an image taken after it is served, then without asking again', async () => {
+    const motionAt = Date.now();
+    const delegate = new StreamingDelegate(createCameraStub({ lastEventAt: motionAt }));
+    let fetched = 0;
+    delegate.fetchLegacySnapshot = async () => { fetched++; return Buffer.from('new'); };
+    delegate.snapshots.set(Buffer.from('cached'), motionAt - 1000);
+
+    const first = await requestSnapshot(delegate);
+    assert.equal(first[1].toString(), 'new');
+
+    const second = await requestSnapshot(delegate);
+    assert.equal(second[1].toString(), 'new');
+    assert.equal(fetched, 1, 'the image is already newer than the motion');
+});
+
+test('a camera that keeps failing shows the unavailable placeholder instead of an old image', async () => {
+    const delegate = new StreamingDelegate(createCameraStub());
+    delegate.fetchLegacySnapshot = async () => { throw new Error('offline'); };
+    delegate.snapshots.set(Buffer.from('old'), Date.now() - 60 * 60000);
+    delegate.snapshots.failures = 2;
 
     const args = await requestSnapshot(delegate);
-    assert.equal(args[1].toString(), 'new');
+    assert.notEqual(args[1].toString(), 'old');
+    assert.ok(args[1].length > 1000);
+});
+
+test('failing battery cameras are retried less often than powered ones', () => {
+    const backoffMax = (overrides) => new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit', ...overrides })).snapshots.options.backoffMax();
+
+    assert.equal(backoffMax({}), 2 * 60000);
+    assert.equal(backoffMax({ isBatteryPowered: () => true }), 30 * 60000);
+    assert.equal(backoffMax({ isBatteryPowered: () => true, isCharging: () => true }), 2 * 60000);
+});
+
+test('snapshots of cameras with a privacy shutter are never written to disk', () => {
+    const indoor = new StreamingDelegate(createCameraStub({ supportsPrivacyShutter: () => true, snapshotPath: '/tmp/indoor.jpg' }));
+    const outdoor = new StreamingDelegate(createCameraStub({ snapshotPath: '/tmp/outdoor.jpg' }));
+
+    assert.equal(indoor.snapshots.options.persistPath, undefined);
+    assert.equal(outdoor.snapshots.options.persistPath, '/tmp/outdoor.jpg');
 });
 
 test('a camera that cannot be reached gets a placeholder rather than holding up HomeKit', async () => {
@@ -155,10 +193,10 @@ test('nothing is fetched while rate limited, a cached image is still served', as
 
 test('privacy shutter state follows the alarm state without blocking on errors', async () => {
     const shutterSettings = { shutterOff: 'closedAlarmOnly', shutterHome: 'open', shutterAway: 'open' };
-    const make = (getRecentAlarmState) => {
+    const make = (getCurrentAlarmState) => {
         const delegate = new StreamingDelegate(createCameraStub({
             supportsPrivacyShutter: () => true,
-            simplisafe: { isBlocked: false, nextAttempt: 0, getRecentAlarmState },
+            simplisafe: { isBlocked: false, nextAttempt: 0, getCurrentAlarmState },
             cameraDetails: {
                 uuid: 'camera-uuid',
                 cameraSettings: { admin: { fps: 20, bitRate: 300 }, pictureQuality: '720p', cameraName: 'Indoor', ...shutterSettings },
@@ -176,6 +214,13 @@ test('privacy shutter state follows the alarm state without blocking on errors',
 
     const unknown = await requestSnapshot(make(async () => null));
     assert.notEqual(unknown[1].toString(), 'real-image', 'an unknown alarm state must not show the camera');
+
+    // exit delay from OFF (closed) to AWAY (open): closed until armed
+    const exitDelay = await requestSnapshot(make(async () => 'AWAY_COUNT'));
+    assert.notEqual(exitDelay[1].toString(), 'real-image');
+
+    const unexpected = await requestSnapshot(make(async () => 'SOMETHING_NEW'));
+    assert.notEqual(unexpected[1].toString(), 'real-image');
 
     const failed = await requestSnapshot(make(async () => { throw new Error('api down'); }));
     assert.ok(failed[0] instanceof Error, 'errors must reach HomeKit instead of leaving it waiting');
@@ -209,9 +254,10 @@ test('legacy live view starts without -re and with low-latency input options', (
 
     assert.ok(!source.includes('-re'));
     const input = source.indexOf('-i');
-    for (const flag of ['-fpsprobesize', '-analyzeduration', '-flags']) {
+    for (const flag of ['-fpsprobesize', '-flags']) {
         assert.ok(source.indexOf(flag) > -1 && source.indexOf(flag) < input, `${flag} must be an input option`);
     }
+    assert.ok(!source.includes('-analyzeduration'), 'a short analyzeduration loses an audio track that starts late');
     assert.equal(video[video.indexOf('-map') + 1], '0:v:0');
     assert.equal(audio[audio.indexOf('-map') + 1], '0:a:0');
     assert.equal(video[video.indexOf('-g') + 1], '40');
@@ -354,4 +400,25 @@ test('startLiveKitStream reports setup failures instead of leaving HAP hanging',
     assert.ok(callbackArgs, 'callback must always be called');
     assert.ok(callbackArgs[0] instanceof Error);
     assert.equal(closed, true, 'the pre-warmed source must be closed');
+});
+
+test('a failed ffmpeg start answers HomeKit exactly once', async () => {
+    const delegate = new StreamingDelegate(createCameraStub({ ffmpegPath: '/nonexistent/ffmpeg' }));
+    delegate.resolveMediaServer = async () => '1.2.3.4';
+    delegate.pendingSessions['uuid:session-1'] = {
+        address: '192.168.1.5', video_port: 5010, audio_port: 5011, video_ssrc: 1, audio_ssrc: 2,
+        video_srtp: Buffer.alloc(30), audio_srtp: Buffer.alloc(30),
+    };
+
+    const calls = [];
+    await delegate.handleStreamRequest({
+        sessionID: 'session-1',
+        type: 'start',
+        video: { width: 1280, fps: 20, max_bit_rate: 299, mtu: 1378 },
+        audio: { codec: 'AAC-eld', max_bit_rate: 24, sample_rate: 16 },
+    }, (...args) => calls.push(args));
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    assert.equal(calls.length, 1);
+    assert.ok(calls[0][0] instanceof Error);
 });

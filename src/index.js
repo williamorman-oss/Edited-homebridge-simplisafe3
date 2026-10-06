@@ -15,6 +15,8 @@ import UnreachableAccessory from './accessories/unreachableAccessory';
 // Named apart from homebridge-simplisafe3 so both can be installed and run side by side
 const PLUGIN_NAME = 'homebridge-simplisafe3-edited';
 const PLATFORM_NAME = 'SimpliSafe 3 Edited';
+// this edition is meant to run the cameras next to the original plugin, which keeps the alarm and sensors
+const DEFAULT_CAMERAS_ONLY = true;
 
 const cameraRefreshInterval = 10 * 60 * 1000; // ms, keeps camera battery and charging state current
 
@@ -26,7 +28,7 @@ class SS3Platform {
         this.log = log;
         this.name = config.name;
         // only cameras, e.g. to run them on their own bridge next to another instance with the alarm and sensors
-        this.camerasOnly = config.camerasOnly || false;
+        this.camerasOnly = config.camerasOnly !== undefined ? !!config.camerasOnly : DEFAULT_CAMERAS_ONLY;
         this.enableCameras = config.cameras || this.camerasOnly;
         this.cameraOptions = config.cameraOptions || null;
         this.debug = config.debug || false;
@@ -131,6 +133,9 @@ class SS3Platform {
                             alarmAccessory.setAccessory(accessory);
                             alarmAccessory.setFault();
                         } else {
+                            if (this.camerasOnly && this.persistAccessories && !accessory.services.find(s => s.UUID == this.api.hap.Service.CameraRTPStreamManagement.UUID)) {
+                                this.log.warn(`'${accessory.displayName}' is kept but no longer updated because Cameras Only is on. Remove it from Homebridge (Settings, Remove Single Cached Accessory) if you don't need it.`);
+                            }
                             this.removeAccessory(accessory);
                         }
                     }

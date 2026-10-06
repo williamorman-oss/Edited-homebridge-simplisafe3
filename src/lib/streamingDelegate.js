@@ -30,6 +30,10 @@ const poweredSnapshotRefreshAge = 60000; // ms, each LiveKit refresh joins the c
 const defaultBatterySnapshotMinutes = 10; // each refresh wakes a battery camera
 const streamSnapshotInterval = 10000; // ms between snapshots taken from a running live view
 const recentEventWindow = 15000; // ms after motion or a doorbell press that snapshots should be new
+const eventSnapshotMaxAge = 5000; // ms, how old an image may be for a notification HomeKit asks for
+const poweredBackoffMax = 2 * 60000; // ms between attempts for a camera that is not responding
+const batteryBackoffMax = 30 * 60000; // ms, a battery camera that is not responding is likely flat
+const staleSnapshotMinAge = 5 * 60000; // ms before a camera that keeps failing shows 'unavailable'
 const legacySnapshotTimeout = 10000; // ms
 const liveKitSnapshotTimeout = 20000; // ms to join and wake a camera, battery cameras took 5-6s from sleep
 const alarmStateTimeout = 3000; // ms to wait for the alarm state when it is not known yet
@@ -62,8 +66,10 @@ class StreamingDelegate {
             refreshAge: () => this.snapshotRefreshAge(),
             budget: snapshotBudget,
             timeout: (liveKit ? liveKitSnapshotTimeout + keyframeTimeout : legacySnapshotTimeout) + 5000,
+            backoffMax: () => this.isOnBattery() ? batteryBackoffMax : poweredBackoffMax,
             canRefresh: () => this.canRefreshSnapshot(),
-            persistPath: ss3Camera.snapshotPath,
+            // images from a camera with a privacy shutter (indoors) are never written to disk
+            persistPath: ss3Camera.supportsPrivacyShutter() ? undefined : ss3Camera.snapshotPath,
             log: this.log,
             debug: ss3Camera.debug
         });
@@ -150,9 +156,12 @@ class StreamingDelegate {
 
             // HomeKit sends a bridge's requests one at a time, so answer from the cache rather than
             // keep every other camera, live view and the alarm waiting on this camera
-            const fresh = this.wantsFreshSnapshot(request);
-            const image = await this.snapshots.get(fresh, fresh ? freshSnapshotBudget : snapshotBudget);
-            if (image) {
+            const notBefore = this.snapshotNotBefore(request);
+            const image = await this.snapshots.get(notBefore, notBefore ? freshSnapshotBudget : snapshotBudget);
+            if (image && this.snapshotIsAbandoned()) {
+                if (this.ss3Camera.debug) this.log(`'${this.ss3Camera.name}' has not responded for ${Math.round(this.snapshots.age() / 60000)} minutes, sending a placeholder`);
+                callback(undefined, snapshotUnavailableImage);
+            } else if (image) {
                 if (this.ss3Camera.debug) this.log(`Closed '${this.ss3Camera.name}' snapshot request with ${Math.round(image.length / 1000)}kB image from ${Math.round(this.snapshots.age() / 1000)}s ago`);
                 callback(undefined, image);
             } else {
@@ -165,38 +174,56 @@ class StreamingDelegate {
         }
     }
 
-    // SimpliCams close their privacy shutter depending on the alarm state, don't let a snapshot open it
+    // SimpliCams close their privacy shutter depending on the alarm state. Unless the shutter is known to be
+    // open, neither show a cached image nor ask the camera, which could open the shutter
     async isPrivacyShutterClosed() {
         if (this.ss3Camera.motionIsTriggered || !this.ss3Camera.supportsPrivacyShutter()) return false;
 
         const settings = this.cameraDetails.cameraSettings;
-        const alarmState = await this.simplisafe.getRecentAlarmState(alarmStateTimeout);
+        const open = setting => setting === 'open';
+        const alarmState = await this.simplisafe.getCurrentAlarmState(alarmStateTimeout);
         switch (alarmState) {
         case 'OFF':
-            return settings.shutterOff !== 'open';
+            return !open(settings.shutterOff);
         case 'HOME':
-            return settings.shutterHome !== 'open';
+            return !open(settings.shutterHome);
         case 'AWAY':
-            return settings.shutterAway !== 'open';
-        case null:
-        case undefined:
-            return true; // unknown, err on the side of privacy
+            return !open(settings.shutterAway);
+        case 'HOME_COUNT': // exit delay, between off and the new mode
+            return !(open(settings.shutterOff) && open(settings.shutterHome));
+        case 'AWAY_COUNT':
+            return !(open(settings.shutterOff) && open(settings.shutterAway));
+        case 'ALARM':
+        case 'ALARM_COUNT':
+            return false; // the shutter opens for an alarm
         default:
-            return false;
+            return true; // unknown, err on the side of privacy
         }
     }
 
-    wantsFreshSnapshot(request) {
+    // A time the snapshot must be newer than: the motion or doorbell press a notification is for, or 0 for any
+    snapshotNotBefore(request) {
+        const lastEventAt = this.ss3Camera.lastEventAt || 0;
+        if (Date.now() - lastEventAt < recentEventWindow) return lastEventAt;
+
         const reasons = this.api.hap.ResourceRequestReason;
         const eventReason = reasons ? reasons.EVENT : 1;
-        const lastEventAt = this.ss3Camera.lastEventAt || 0;
-        return request.reason === eventReason || Date.now() - lastEventAt < recentEventWindow;
+        return request.reason === eventReason ? Date.now() - eventSnapshotMaxAge : 0;
+    }
+
+    isOnBattery() {
+        return this.ss3Camera.getStreamProvider() === 'livekit' && this.ss3Camera.isBatteryPowered() && !this.ss3Camera.isCharging();
+    }
+
+    // A camera that keeps failing should not show an old image as if it were current forever
+    snapshotIsAbandoned() {
+        return this.snapshots.failures >= 2 && this.snapshots.age() > Math.max(staleSnapshotMinAge, 3 * this.snapshotRefreshAge());
     }
 
     snapshotRefreshAge() {
         if (this.ss3Camera.getStreamProvider() !== 'livekit') return legacySnapshotRefreshAge;
 
-        if (this.ss3Camera.isBatteryPowered() && !this.ss3Camera.isCharging()) {
+        if (this.isOnBattery()) {
             const minutes = Number(this.cameraOptions && this.cameraOptions.batterySnapshotMinutes) || defaultBatterySnapshotMinutes;
             return Math.max(1, minutes) * 60000;
         }
@@ -359,12 +386,20 @@ class StreamingDelegate {
 
                 let sessionInfo = this.pendingSessions[sessionIdentifier];
                 if (sessionInfo) {
+                    // HomeKit's callback throws if called twice, e.g. on both 'error' and 'close' of a failed spawn
+                    let answered = false;
+                    const answer = err => {
+                        if (answered) return;
+                        answered = true;
+                        callback(err);
+                    };
+
                     try {
                         await this.resolveMediaServer();
                     } catch (err) {
                         delete this.pendingSessions[sessionIdentifier];
                         this.log.error('Camera stream request failed:', err.message);
-                        callback(err);
+                        answer(err);
                         return;
                     }
 
@@ -388,7 +423,7 @@ class StreamingDelegate {
                             if (!started) {
                                 started = true;
                                 if (this.ss3Camera.debug) this.log('FFMPEG received first frame');
-                                callback(); // do not forget to execute callback once set up
+                                answer(); // do not forget to execute callback once set up
                             }
                             if (this.ss3Camera.debug) {
                                 this.log(data.toString());
@@ -397,7 +432,7 @@ class StreamingDelegate {
     
                         cmd.on('error', err => {
                             this.log.error('An error occurred while making stream request:', err);
-                            callback(err);
+                            answer(err);
                         });
     
                         cmd.on('close', code => {
@@ -410,7 +445,7 @@ class StreamingDelegate {
                             default:
                                 if (this.ss3Camera.debug) this.log(`Error: FFmpeg exited with code ${code}`);
                                 if (!started) {
-                                    callback(new Error(`Error: FFmpeg exited with code ${code}`));
+                                    answer(new Error(`Error: FFmpeg exited with code ${code}`));
                                 } else {
                                     this.controller.forceStopStreamingSession(sessionId);
                                 }
@@ -421,7 +456,7 @@ class StreamingDelegate {
                         this.ongoingSessions[sessionIdentifier] = cmd;
                     } catch (e) {
                         this.log.error(`Unable to spawn ffmpeg process at ${this.ss3Camera.ffmpegPath} with error:`, e);
-                        callback(e);
+                        answer(e);
                     }
                 } else {
                     callback(new Error('No pending session for stream start'));
@@ -469,9 +504,9 @@ class StreamingDelegate {
         let sourceArgs = [
             // Take the frame rate from the stream metadata rather than probing 2s of video, and decode
             // without frame threading, which holds back a frame per thread. No -re, on a live source it
-            // keeps the startup backlog as delay for the whole session
+            // keeps the startup backlog as delay for the whole session. -analyzeduration stays at its
+            // default so a late audio track is still found
             ['-fpsprobesize', '0'],
-            ['-analyzeduration', '1000000'],
             ['-flags', 'low_delay'],
             ['-headers', `Authorization: Bearer ${this.ss3Camera.authManager.accessToken}`],
             ['-i', `https://${this.serverIpAddress}/v1/${this.cameraDetails.uuid}/flv?x=${width}&audioEncoding=AAC`]

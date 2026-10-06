@@ -66,18 +66,26 @@ test('without an image it waits at most the budget, then resolves null and keeps
     assert.equal((await cache.get()).toString(), 'slow');
 });
 
-test('a fresh request waits for a new image even when one is cached', async () => {
+test('a request for an image newer than an event waits for one', async () => {
     const { cache } = createCache({ fetch: () => delay(10).then(() => Buffer.from('new')) });
-    cache.set(Buffer.from('cached'));
+    cache.set(Buffer.from('cached'), Date.now() - 1000);
 
-    assert.equal((await cache.get(true)).toString(), 'new');
+    assert.equal((await cache.get(Date.now() - 500)).toString(), 'new');
 });
 
-test('a fresh request falls back to the cached image when the camera is too slow', async () => {
-    const { cache } = createCache({ fetch: () => delay(200).then(() => Buffer.from('new')) });
-    cache.set(Buffer.from('cached'));
+test('an image already newer than the event is served without asking the camera', async () => {
+    const { cache, calls } = createCache();
+    cache.set(Buffer.from('after-event'));
 
-    assert.equal((await cache.get(true, 20)).toString(), 'cached');
+    assert.equal((await cache.get(Date.now() - 500)).toString(), 'after-event');
+    assert.equal(calls.fetch, 0);
+});
+
+test('falls back to the cached image when the camera is too slow for a newer one', async () => {
+    const { cache } = createCache({ fetch: () => delay(200).then(() => Buffer.from('new')) });
+    cache.set(Buffer.from('cached'), Date.now() - 1000);
+
+    assert.equal((await cache.get(Date.now(), 20)).toString(), 'cached');
 });
 
 test('backs off after a failure and recovers after a success', async () => {
@@ -112,7 +120,7 @@ test('backs off after a failure and recovers after a success', async () => {
     assert.equal(cache.failing, false);
 });
 
-test('a fresh request ignores the backoff', async () => {
+test('a request for a newer image ignores the backoff', async () => {
     let now = 0;
     let fail = true;
     const { cache, calls } = createCache({
@@ -122,7 +130,7 @@ test('a fresh request ignores the backoff', async () => {
 
     await cache.get();
     fail = false;
-    assert.equal((await cache.get(true)).toString(), 'ok');
+    assert.equal((await cache.get(1)).toString(), 'ok');
     assert.equal(calls.fetch, 2);
 });
 
@@ -188,20 +196,22 @@ test('the last image is saved to disk and loaded with its age after a restart', 
     const file = path.join(dir, 'nested', 'camera.jpg');
 
     try {
+        const saved = Buffer.from([0xFF, 0xD8, 0x00, 0x01, 0xFF, 0xD9]);
         const { cache } = createCache({ persistPath: file, persistInterval: 0 });
-        cache.set(Buffer.from('saved'));
+        cache.set(saved);
         await delay(20);
-        assert.equal(fs.readFileSync(file).toString(), 'saved');
+        assert.deepEqual(fs.readFileSync(file), saved);
+        assert.ok(!fs.existsSync(`${file}.tmp`));
 
         const past = new Date(Date.now() - 60000);
         fs.utimesSync(file, past, past);
 
         const { cache: restarted, calls } = createCache({ persistPath: file, refreshAge: 1000 });
-        assert.equal(restarted.image.toString(), 'saved');
+        assert.deepEqual(restarted.image, saved);
         assert.ok(restarted.age() >= 59000);
 
         // served at once, and refreshed because it is old
-        assert.equal((await restarted.get()).toString(), 'saved');
+        assert.deepEqual(await restarted.get(), saved);
         assert.equal(calls.fetch, 1);
     } finally {
         fs.rmSync(dir, { recursive: true, force: true });
@@ -219,6 +229,40 @@ test('saving is throttled to spare SD cards', async () => {
         cache.set(Buffer.from('second'));
         await delay(20);
         assert.equal(fs.readFileSync(file).toString(), 'first');
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test('the backoff limit can depend on the camera, e.g. longer on battery', async () => {
+    let now = 0;
+    let max = 1000;
+    const { cache } = createCache({
+        now: () => now,
+        backoffInitial: 1000,
+        backoffMax: () => max,
+        fetch: () => Promise.reject(new Error('down')),
+    });
+
+    await cache.get();
+    now = 1000; await cache.get();
+    now = 2000; await cache.get();
+    assert.equal(cache.failures, 3, 'capped at 1s, so every second is tried');
+
+    max = 60000;
+    now = 3000; await cache.get();
+    now = 4000; await cache.get();
+    assert.equal(cache.failures, 4, 'the next wait follows the new limit');
+});
+
+test('a saved file that is not a complete JPEG is ignored', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ss3-snapshots-'));
+    const file = path.join(dir, 'camera.jpg');
+
+    try {
+        fs.writeFileSync(file, Buffer.from([0xFF, 0xD8, 0x01, 0x02])); // cut off before the end marker
+        const { cache } = createCache({ persistPath: file });
+        assert.equal(cache.image, null);
     } finally {
         fs.rmSync(dir, { recursive: true, force: true });
     }

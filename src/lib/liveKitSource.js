@@ -100,6 +100,7 @@ class LiveKitSource {
             });
 
             this.ws.on('message', async data => {
+                if (this.closed) return; // e.g. a join arriving after a timeout, would open a peer connection nobody closes
                 let response;
                 try {
                     response = SignalResponse.fromBinary(new Uint8Array(data));
@@ -151,6 +152,7 @@ class LiveKitSource {
     }
 
     _handleJoin(join, send) {
+        if (this.closed) return;
         if (this.debug) this.log(`LiveKit: joined room ${join.room && join.room.name}`);
 
         this.pc = new RTCPeerConnection({

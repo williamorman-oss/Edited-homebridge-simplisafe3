@@ -7,7 +7,9 @@ All notable changes are documented here.
 - Outdoor Camera: battery level and charging state in HomeKit, less frequent snapshots while on battery (`batterySnapshotMinutes`), placeholder and back-off for cameras that do not respond, no more "Sensor not (yet) supported" warnings
 - New `camerasOnly` option to run cameras on their own bridge
 - Fix: `"-tune false"` style options now remove the argument as documented, and new `videoOptions` / `audioOptions` arguments are no longer ignored
+- SimpliCam privacy shutter: snapshots are only shown or fetched while the alarm state is known (checked at most 10 seconds earlier) and the shutter is open for it; otherwise the privacy image is shown. Its snapshots are never written to disk
 - Fix: a failed SimpliSafe request during a SimpliCam snapshot could leave HomeKit waiting and crash the bridge
+- Fix: if ffmpeg could not be started, HomeKit was answered twice, which crashed the bridge
 - Fix: LiveKit audio packets could be sent to HomeKit twice
 - The access token is no longer written to the debug log
 

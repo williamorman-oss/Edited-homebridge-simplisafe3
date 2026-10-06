@@ -66,3 +66,12 @@ test('a track announced again on renegotiation is only listened to once', () => 
 
     source.close();
 });
+
+test('a join arriving after the source was closed opens nothing', () => {
+    const source = new LiveKitSource(createCamera());
+    source.close();
+    source._handleJoin({ iceServers: [], pingInterval: 1 }, () => {});
+
+    assert.equal(source.pc, null);
+    assert.equal(source.pingIntervalID, null);
+});

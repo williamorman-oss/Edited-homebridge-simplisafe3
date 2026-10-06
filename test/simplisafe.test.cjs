@@ -137,7 +137,7 @@ test('getAlarmSystem records the alarm state and shares the system with listener
     assert.deepEqual(shared.cameras, [{ uuid: 'cam' }]);
 });
 
-test('getRecentAlarmState uses a recent state without a request', async () => {
+test('getCurrentAlarmState uses a state seen in the last few seconds without a request', async () => {
     let requests = 0;
     const { default: SimpliSafe3 } = loadSimplisafe({
         requestImpl: async () => { requests++; return subscriptionResponse({ alarmState: 'AWAY' }); },
@@ -146,40 +146,57 @@ test('getRecentAlarmState uses a recent state without a request', async () => {
     ss.subId = 123;
 
     ss.recordAlarmState('OFF');
-    assert.equal(await ss.getRecentAlarmState(), 'OFF');
+    assert.equal(await ss.getCurrentAlarmState(), 'OFF');
     assert.equal(requests, 0);
 });
 
-test('getRecentAlarmState serves an old state and refreshes it for next time', async () => {
+test('getCurrentAlarmState asks again rather than trusting an older state', async () => {
     let requests = 0;
     const { default: SimpliSafe3 } = loadSimplisafe({
-        requestImpl: async () => { requests++; return subscriptionResponse({ alarmState: 'AWAY' }); },
+        requestImpl: async () => { requests++; return subscriptionResponse({ alarmState: 'OFF' }); },
     });
     const ss = new SimpliSafe3(15000, new FakeAuthManager(), '/tmp', createLogger(), false);
     ss.subId = 123;
-    ss.lastAlarmState = 'OFF';
-    ss.lastAlarmStateAt = Date.now() - 120000;
+    ss.recordAlarmState('AWAY', Date.now() - 60000);
 
-    assert.equal(await ss.getRecentAlarmState(), 'OFF');
-    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(await ss.getCurrentAlarmState(), 'OFF');
     assert.equal(requests, 1);
-    assert.equal(ss.lastAlarmState, 'AWAY');
 });
 
-test('getRecentAlarmState asks SimpliSafe when the state is unknown, and gives up after the timeout', async () => {
+test('getCurrentAlarmState never falls back to an older state when SimpliSafe does not answer', async () => {
+    let fail = false;
     let hang = false;
     const { default: SimpliSafe3 } = loadSimplisafe({
-        requestImpl: () => hang ? new Promise(() => {}) : Promise.resolve(subscriptionResponse({ alarmState: 'HOME' })),
+        requestImpl: () => hang ? new Promise(() => {})
+            : fail ? Promise.reject(Object.assign(new Error('down'), { response: { status: 500, data: 'down' } }))
+                : Promise.resolve(subscriptionResponse({ alarmState: 'HOME' })),
     });
     const ss = new SimpliSafe3(15000, new FakeAuthManager(), '/tmp', createLogger(), false);
     ss.subId = 123;
 
-    assert.equal(await ss.getRecentAlarmState(), 'HOME');
+    assert.equal(await ss.getCurrentAlarmState(), 'HOME');
+
+    ss.lastAlarmStateAt = Date.now() - 60000;
+    ss.lastSubscriptionRequests = {};
+    fail = true;
+    assert.equal(await ss.getCurrentAlarmState(), null);
 
     const slow = new SimpliSafe3(15000, new FakeAuthManager(), '/tmp', createLogger(), false);
     slow.subId = 456;
+    slow.recordAlarmState('AWAY', Date.now() - 60000);
     hang = true;
-    assert.equal(await slow.getRecentAlarmState(20), null);
+    assert.equal(await slow.getCurrentAlarmState(20), null);
+});
+
+test('an API reply older than a realtime event does not override it', () => {
+    const { default: SimpliSafe3, EVENT_TYPES, SENSOR_TYPES } = loadSimplisafe({ requestImpl: async () => ({ data: {} }) });
+    const ss = new SimpliSafe3(15000, new FakeAuthManager(), '/tmp', createLogger(), false);
+
+    const requestedAt = Date.now() - 1000;
+    ss.emit(EVENT_TYPES.ALARM_DISARM, { sensorType: SENSOR_TYPES.KEYPAD });
+    ss.recordAlarmState('AWAY', requestedAt);
+
+    assert.equal(ss.lastAlarmState, 'OFF');
 });
 
 test('arming and disarming events from a keypad or the app update the known alarm state', () => {
@@ -190,6 +207,23 @@ test('arming and disarming events from a keypad or the app update the known alar
     assert.equal(ss.lastAlarmState, 'AWAY');
     ss.emit(EVENT_TYPES.ALARM_DISARM, { sensorType: SENSOR_TYPES.APP });
     assert.equal(ss.lastAlarmState, 'OFF');
-    ss.emit(EVENT_TYPES.HOME_ARM, { sensorType: SENSOR_TYPES.ENTRY_SENSOR });
-    assert.equal(ss.lastAlarmState, 'OFF', 'mirrors the alarm accessory, which ignores other sources');
+    ss.emit(EVENT_TYPES.AWAY_ARM, { sensorType: '253' }); // Smart Lock PIN pad
+    assert.equal(ss.lastAlarmState, 'AWAY');
+
+    // a change from a source the state can't be read from forgets the state, so it is asked for again
+    ss.emit(EVENT_TYPES.ALARM_DISARM, { sensorType: 15 });
+    assert.equal(ss.lastAlarmState, null);
+});
+
+test('a timeout blocks requests briefly without growing the block like a rate limit', async () => {
+    const { default: SimpliSafe3, RateLimitError } = loadSimplisafe({
+        requestImpl: () => Promise.reject(Object.assign(new Error('timeout of 30000ms exceeded'), { code: 'ECONNABORTED' })),
+    });
+    const ss = new SimpliSafe3(15000, new FakeAuthManager(), '/tmp', createLogger(), false);
+    const before = ss.nextBlockInterval;
+
+    await assert.rejects(ss.request({ method: 'GET', url: '/x' }), (err) => err instanceof RateLimitError);
+    assert.equal(ss.isBlocked, true);
+    assert.ok(ss.nextAttempt - Date.now() <= before);
+    assert.equal(ss.nextBlockInterval, before);
 });

@@ -23,15 +23,17 @@ This is a fork of [homebridge-simplisafe3](https://github.com/homebridge-simplis
 ### Installing alongside the original
 1. In the Homebridge UI open the terminal (top right menu, **Terminal**) and run:
    ```
-   npm install --prefix /var/lib/homebridge https://github.com/williamorman-oss/Edited-homebridge-simplisafe3/raw/master/releases/homebridge-simplisafe3-edited-1.12.0-beta.1.tgz
+   npm install --prefix /var/lib/homebridge https://github.com/williamorman-oss/Edited-homebridge-simplisafe3/raw/edited-1.12.0-beta.2/releases/homebridge-simplisafe3-edited-1.12.0-beta.2.tgz
    ```
-   Use your Homebridge storage folder if it is not `/var/lib/homebridge` (e.g. `/homebridge` in Docker). Before this is merged, replace `master` with `outdoor-cameras-batch1`.
+   Use your Homebridge storage folder if it is not `/var/lib/homebridge` (e.g. `/homebridge` in Docker). The link points at a tagged release that never changes. npm records it in the storage folder's `package.json`, so it has to stay available.
 2. Restart Homebridge. **SimpliSafe 3 (Edited)** appears under Plugins.
-3. Open its settings and log in to SimpliSafe (this is a separate login from the original plugin). Save.
+3. Open its settings and log in to SimpliSafe (this is a separate login from the original plugin). The name you give it (default `SimpliSafe Cameras`) is what its log lines start with. Save.
 4. Under the plugin's **Bridge Settings**, turn on the child bridge and restart Homebridge.
 5. In the Home app add the new bridge (Add Accessory, then scan the child bridge's QR code from the Homebridge UI).
 
-To avoid every camera being handled twice, turn off `cameras` (or exclude the cameras) in the original plugin once you are happy with this one. To remove this version, uninstall **SimpliSafe 3 (Edited)** from the Plugins page and remove its bridge from the Home app.
+Once you are happy with it, turn off `cameras` in the original plugin so cameras are not handled twice. The original keeps its old camera tiles (without video) until you remove them: in the Homebridge UI go to Settings, **Remove Single Cached Accessory**, and remove the camera accessories of the original plugin's bridge. Automations that used those old camera tiles need to be set up again on the new ones.
+
+To remove this version, uninstall **SimpliSafe 3 (Edited)** from the Plugins page and remove its bridge from the Home app. If installing or updating any plugin ever fails with a 404 for `homebridge-simplisafe3-edited`, run `npm uninstall --prefix /var/lib/homebridge homebridge-simplisafe3-edited` and then install it again with the current link. Restoring a Homebridge backup does not reinstall this version (it is not on npm), run the install command again afterwards.
 
 ## Requirements
 - Works with native Homebridge and [oznu/docker-homebridge](https://github.com/oznu/docker-homebridge).
@@ -54,19 +56,14 @@ Here are some example screenshots:
 
 This plugin supports installation and changing settings (for `config.js`) via the popular [Config UI X plugin](https://github.com/oznu/homebridge-config-ui-x) which is recommended for easiest usage.
 
-Either install and configure using Config UI X or you can manually install the plugin by running:
-
-```
-npm install -g --unsafe-perm homebridge-simplisafe3
-```
-
-If installing manually, add the following configuration to the `platforms` array in your Homebridge `config.json` and then proceed with <a href="#simplisafe-authentication">authentication</a>.
+Install this edited version as described in [Installing alongside the original](#installing-alongside-the-original). If you configure it by hand, add the following to the `platforms` array in your Homebridge `config.json` and then proceed with <a href="#simplisafe-authentication">authentication</a>.
 
 
 ```
 {
-    "platform": "homebridge-simplisafe3.SimpliSafe 3",
-    "name": "Home Alarm"
+    "platform": "homebridge-simplisafe3-edited.SimpliSafe 3 Edited",
+    "name": "SimpliSafe Cameras",
+    "camerasOnly": true
 }
 ```
 
@@ -83,7 +80,7 @@ In 2021, SimpliSafe transitioned to only supporting a protocol called OAuth for 
     - Safari v15.1+ neither displays the URL in the console nor visually in the URL bar and thus is not recommended for this process.
     - Also note that this process cannot be performed on a mobile device.
 
- 1. Alternatively the plugin provides a command-line method for authenticating. The process works the same as above and can be run using `homebridge-simplisafe3 login`. If you are using a non-standard storage location for Homebridge pass the `-d` argument e.g. `homebridge-simplisafe3 login -d /path/to/storage/`.
+ 1. Alternatively the plugin provides a command-line method for authenticating. The process works the same as above and can be run using `homebridge-simplisafe3-edited login`. If you are using a non-standard storage location for Homebridge pass the `-d` argument e.g. `homebridge-simplisafe3-edited login -d /var/lib/homebridge`.
 
 #### Error & Authentication Failure Notifications
 
@@ -96,9 +93,9 @@ In 2021, SimpliSafe transitioned to only supporting a protocol called OAuth for 
 These enable camera support. See [Camera Support](#camera-support) for more details.
 
 #### `camerasOnly`
-Type: boolean (default `false`)
+Type: boolean (default `true` in this edited version)
 
-Only add cameras, not the alarm, sensors or locks. HomeKit sends each bridge's requests one at a time, so running the cameras on their own [child bridge](https://github.com/homebridge/homebridge/wiki/Child-Bridges) means a slow camera can never hold up the alarm. See [Running the cameras separately](#running-the-cameras-separately).
+Only add cameras, not the alarm, sensors or locks, and turns on `cameras`. HomeKit sends each bridge's requests one at a time, so running the cameras on their own [child bridge](https://github.com/homebridge/homebridge/wiki/Child-Bridges) means a slow camera can never hold up the alarm. Set it to `false` to use this version for everything instead of the original plugin.
 
 #### `debug`
 Type: boolean (default `false`)
@@ -167,9 +164,6 @@ HomeKit sends a bridge's requests one at a time: camera snapshots, starting a li
 #### Battery cameras
 Battery cameras such as the Outdoor Camera sleep between events, and every snapshot or live view wakes them, which takes 5-10 seconds and uses battery. While a battery camera is not charging its snapshot is only refreshed when it is more than `batterySnapshotMinutes` (default `10`) old, or for a motion notification. Cameras that are plugged in or charging from a solar panel refresh every minute. If a camera does not respond (e.g. its battery is empty) the plugin shows a placeholder image and waits longer and longer between attempts. Battery cameras also report their battery level and charging state to HomeKit.
 
-#### Running the cameras separately
-To keep cameras from ever slowing down the alarm, add a second instance of the platform with `"camerasOnly": true` and run it as a child bridge, and turn `cameras` off in the instance that has the alarm.
-
 #### Camera Options
 This plugin includes [ffmpeg-for-homebridge](https://github.com/homebridge/ffmpeg-for-homebridge) to automatically include a compatible build of ffmpeg and thus the plugin works "out of the box" without requiring a custom ffmpeg build.
 
@@ -178,9 +172,9 @@ For advanced scenarios including specifying a custom ffmpeg build or command lin
 ```
 "cameraOptions": {
     "ffmpegPath": "/path/to/custom/ffmpeg",
-    "sourceOptions": "-format: flv ... (any other ffmpeg argument)",
-    "videoOptions": "-vcodec h264_omx -tune false ... (any other ffmpeg argument)",
-    "audioOptions": "-ar 256k ... (any other ffmpeg argument)",
+    "sourceOptions": "-probesize 500000",
+    "videoOptions": "-preset ultrafast -tune false",
+    "audioOptions": "-b:a 32k",
     "batterySnapshotMinutes": 10
 }
 ```
@@ -189,7 +183,7 @@ Any arguments provided in `sourceOptions`, `videoOptions` and `audioOptions` wil
 To add an argument that requires no additional parameter, e.g. `-re`, then add it as `"-re"`.
 To remove a default argument, define it with `false` as its value, e.g. `"-tune false"`.
 
-*Note that `sourceOptions`, `videoOptions` and hardware acceleration only affect cameras that are transcoded, so they have no effect on the video from e.g. Video Doorbell Series 2.*
+*Note that `sourceOptions`, `videoOptions`, `audioOptions` and hardware acceleration only affect cameras that are transcoded (SimpliCam, Video Doorbell Pro), so they have no effect on e.g. the Video Doorbell Series 2 or Outdoor Camera.*
 
 #### FFMPEG Hardware Acceleration
  The bundled build of ffmpeg *includes* hardware acceleration on supported Raspberry Pi models (disabled as of Raspberry Pi 5) but in order to enable this you must check the setting **Advanced Camera Settings** > **Enable Hardware Acceleration for Raspberry Pi** (or set `"enableHwaccelRpi"` under `"cameraOptions"` to `true` in `config.json`).

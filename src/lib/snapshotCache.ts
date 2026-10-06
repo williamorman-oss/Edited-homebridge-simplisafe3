@@ -14,7 +14,7 @@ export interface SnapshotCacheOptions {
     // ms before a refresh is given up on, so a hung camera never blocks later refreshes
     timeout?: number;
     backoffInitial?: number;
-    backoffMax?: number;
+    backoffMax?: number | (() => number);
     canRefresh?: () => boolean;
     persistPath?: string;
     persistInterval?: number;
@@ -28,6 +28,9 @@ const defaultTimeout = 30000; // ms
 const defaultBackoffInitial = 60000; // ms
 const defaultBackoffMax = 30 * 60000; // ms
 const defaultPersistInterval = 5 * 60000; // ms, keeps SD card writes down
+
+const isJpeg = (image: Buffer): boolean => image.length > 4 &&
+    image[0] === 0xFF && image[1] === 0xD8 && image[image.length - 2] === 0xFF && image[image.length - 1] === 0xD9;
 
 // Keeps the last snapshot of a camera so HomeKit can be answered straight away.
 // HomeKit sends a bridge's requests one at a time, so a snapshot that waits on the
@@ -59,14 +62,15 @@ class SnapshotCache {
     }
 
     // Resolves with the best image available within the budget (ms), or null if there is none.
-    // fresh asks for a new image, e.g. for a doorbell or motion notification
-    async get(fresh = false, budget = this.options.budget ?? defaultBudget): Promise<Buffer | null> {
-        if (this.image && !fresh) {
+    // notBefore (a time) asks for an image taken after it, e.g. after the motion or doorbell press
+    // a notification is for; an older image is only served if no new one arrives within the budget
+    async get(notBefore = 0, budget = this.options.budget ?? defaultBudget): Promise<Buffer | null> {
+        if (this.image && this.takenAt >= notBefore) {
             if (this.age() >= this.refreshAge()) this.refresh();
             return this.image;
         }
 
-        const refresh = this.refresh(fresh);
+        const refresh = this.refresh(notBefore > 0);
         if (!refresh) return this.image;
 
         let timeoutID: ReturnType<typeof setTimeout> | undefined;
@@ -112,7 +116,9 @@ class SnapshotCache {
             }, (err: Error) => {
                 this.failures++;
                 const initial = this.options.backoffInitial ?? defaultBackoffInitial;
-                const backoff = Math.min(this.options.backoffMax ?? defaultBackoffMax, initial * 2 ** (this.failures - 1));
+                const { backoffMax } = this.options;
+                const max = typeof backoffMax === 'function' ? backoffMax() : backoffMax ?? defaultBackoffMax;
+                const backoff = Math.min(max, initial * 2 ** (this.failures - 1));
                 this.retryAt = this.now() + backoff;
                 const log = this.options.log;
                 if (log) {
@@ -144,7 +150,9 @@ class SnapshotCache {
 
         try {
             const stats = fs.statSync(file);
-            this.image = fs.readFileSync(file);
+            const image = fs.readFileSync(file);
+            if (!isJpeg(image)) return;
+            this.image = image;
             this.takenAt = stats.mtimeMs;
             this.lastPersist = stats.mtimeMs;
         } catch {
@@ -158,8 +166,11 @@ class SnapshotCache {
 
         this.lastPersist = this.now();
         const image = this.image;
+        // written aside and renamed, so a restart mid-write never finds half an image
+        const temporary = `${file}.tmp`;
         fs.promises.mkdir(path.dirname(file), { recursive: true })
-            .then(() => fs.promises.writeFile(file, image))
+            .then(() => fs.promises.writeFile(temporary, image))
+            .then(() => fs.promises.rename(temporary, file))
             .catch(err => {
                 if (this.options.debug && this.options.log) this.options.log(`Could not save snapshot for '${this.options.name}': ${err.message}`);
             });

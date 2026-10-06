@@ -92,3 +92,24 @@ test('camera details from a system refresh reach the camera', async () => {
 
     assert.equal(ctx.devices[0].updated, details);
 });
+
+test('this edition only adds cameras unless told otherwise', () => {
+    const fs = require('node:fs');
+    const os = require('node:os');
+    const storage = fs.mkdtempSync(path.join(os.tmpdir(), 'ss3-platform-'));
+    const log = () => {};
+    log.error = () => {};
+    const api = { user: { storagePath: () => storage }, on: () => {}, hap: { uuid: { generate: (id) => id } } };
+
+    try {
+        const byDefault = new SS3Platform(log, { name: 'SimpliSafe Cameras' }, api);
+        assert.equal(byDefault.camerasOnly, true);
+        assert.equal(byDefault.enableCameras, true);
+
+        const everything = new SS3Platform(log, { name: 'SimpliSafe', camerasOnly: false }, api);
+        assert.equal(everything.camerasOnly, false);
+        assert.equal(everything.enableCameras, false);
+    } finally {
+        fs.rmSync(storage, { recursive: true, force: true });
+    }
+});
