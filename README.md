@@ -3,22 +3,24 @@
 <a href="https://github.com/homebridge/homebridge/wiki/Verified-Plugins"><img alt="homebridge-verified" src="https://raw.githubusercontent.com/homebridge/branding/master/logos/homebridge-color-round.png" width="80px"></a>
 <img alt="SimpliSafe Logo" src="https://raw.githubusercontent.com/homebridge-simplisafe3/homebridge-simplisafe3/master/.github/simplisafe_logo_wplus.png" width="380px" />
 
-# Homebridge SimpliSafe 3
-Created by [Niccolò Zapponi](https://twitter.com/nzapponi) and [Michael Shamoon](https://github.com/shamoon).
+# Homebridge SimpliSafe 3 Cameras (Edited)
+Based on homebridge-simplisafe3, created by [Niccolò Zapponi](https://twitter.com/nzapponi) and [Michael Shamoon](https://github.com/shamoon).
 
 [![npm-version](https://badgen.net/npm/v/homebridge-simplisafe3)](https://www.npmjs.com/package/homebridge-simplisafe3)
 [![npm-downloads](https://badgen.net/npm/dt/homebridge-simplisafe3)](https://www.npmjs.com/package/homebridge-simplisafe3)
 [![verified-by-homebridge](https://badgen.net/badge/homebridge/verified/purple)](https://github.com/homebridge/homebridge/wiki/Verified-Plugins)
 
-An [unofficial] [Homebridge](https://github.com/homebridge/homebridge) plugin to integrate the SimpliSafe 3 home security system with HomeKit.
+An [unofficial] [Homebridge](https://github.com/homebridge/homebridge) plugin that brings SimpliSafe cameras to HomeKit, alongside homebridge-simplisafe3 for the alarm, sensors and locks.
 
 </span>
 
 ## About this edited version
-This is a fork of [homebridge-simplisafe3](https://github.com/homebridge-simplisafe3/homebridge-simplisafe3) with faster cameras and better Outdoor Camera support (see the [change log](CHANGELOG.md)). It is packaged as **homebridge-simplisafe3-edited** so it can be installed **next to** the original plugin without touching it:
+This is a camera-only fork of [homebridge-simplisafe3](https://github.com/homebridge-simplisafe3/homebridge-simplisafe3) with faster cameras, Outdoor Camera support and HomeKit Secure Video recording (see the [change log](CHANGELOG.md)). It is packaged as **homebridge-simplisafe3-edited** so it can be installed **next to** the original plugin without touching it:
 
+- it only has cameras: the alarm, sensors and locks stay with the original plugin. This one never changes them, it only reads the alarm state to know when a SimpliCam's privacy shutter is closed
 - its own platform (`SimpliSafe 3 Edited`) and its own SimpliSafe login (`simplisafe3auth-edited.json`), so the two never sign each other out
-- by default it only adds cameras (`camerasOnly`), so the alarm, sensors and locks stay with the original plugin
+- its own snapshot folder and log file in the Homebridge storage folder
+
 
 ### Installing alongside the original
 1. In the Homebridge UI open the terminal (top right menu, **Terminal**) and run the install command listed for the latest release in the [change log](CHANGELOG.md). It looks like this:
@@ -26,14 +28,14 @@ This is a fork of [homebridge-simplisafe3](https://github.com/homebridge-simplis
    npm install --prefix /var/lib/homebridge https://github.com/williamorman-oss/Edited-homebridge-simplisafe3/raw/<commit>/releases/homebridge-simplisafe3-edited-<version>.tgz
    ```
    Use your Homebridge storage folder if it is not `/var/lib/homebridge` (e.g. `/homebridge` in Docker). Each release's link points at a fixed commit, so it never changes. npm records it in the storage folder's `package.json`, so it has to stay available.
-2. Restart Homebridge. **SimpliSafe 3 (Edited)** appears under Plugins.
+2. Restart Homebridge. **SimpliSafe 3 Cameras (Edited)** appears under Plugins.
 3. Open its settings and log in to SimpliSafe (this is a separate login from the original plugin). The name you give it (default `SimpliSafe Cameras`) is what its log lines start with. Save.
 4. Under the plugin's **Bridge Settings**, turn on the child bridge and restart Homebridge.
 5. In the Home app add the new bridge (Add Accessory, then scan the child bridge's QR code from the Homebridge UI).
 
-Once you are happy with it, turn off `cameras` in the original plugin so cameras are not handled twice. The original keeps its old camera tiles (without video) until you remove them: in the Homebridge UI go to Settings, **Remove Single Cached Accessory**, and remove the camera accessories of the original plugin's bridge. Automations that used those old camera tiles need to be set up again on the new ones.
+Once you are happy with it, turn off `cameras` in the original plugin so cameras are not handled twice. A camera is the same accessory in both plugins, so if both have cameras on and share a bridge, this one cannot add them and says so in the log. The original keeps its old camera tiles (without video) until you remove them: in the Homebridge UI go to Settings, **Remove Single Cached Accessory**, and remove the camera accessories of the original plugin's bridge. Automations that used those old camera tiles need to be set up again on the new ones.
 
-To remove this version, uninstall **SimpliSafe 3 (Edited)** from the Plugins page and remove its bridge from the Home app. If installing or updating any plugin ever fails with a 404 for `homebridge-simplisafe3-edited`, run `npm uninstall --prefix /var/lib/homebridge homebridge-simplisafe3-edited` and then install it again with the current link. Restoring a Homebridge backup does not reinstall this version (it is not on npm), run the install command again afterwards.
+To remove this version, uninstall **SimpliSafe 3 Cameras (Edited)** from the Plugins page and remove its bridge from the Home app. If installing or updating any plugin ever fails with a 404 for `homebridge-simplisafe3-edited`, run `npm uninstall --prefix /var/lib/homebridge homebridge-simplisafe3-edited` and then install it again with the current link. Restoring a Homebridge backup does not reinstall this version (it is not on npm), run the install command again afterwards.
 
 ### Logs for Claude
 The plugin's settings page has a **Logs for Claude** card. It shows this plugin's recent log lines (up to about 800), each camera's state at the top, and a **Copy logs for Claude** button to paste them into a conversation with Claude.
@@ -48,17 +50,10 @@ The plugin's settings page has a **Logs for Claude** card. It shows this plugin'
 - Compatible with the official [Config UI X plugin](https://github.com/oznu/homebridge-config-ui-x) which is **recommended for easiest usage**.
 
 ## Features
-Supercharge your SimpliSafe system and integrate with HomeKit the right way!
-This plugin supports:
-- **Real time event streaming:** get immediate notifications anytime the alarm is armed / disarmed / triggered.
-- **Sensors:** always be on top of your home with immediate access to the sensor status. Create smart automations directly from the Home app (e.g. when the front door is opened, turn the lights on).
-- **Door locks:** lock, unlock and monitor the battery status of your smart door locks.
-- **Cameras:** view your indoor or doorbell cameras directly from the Home app, receive doorbell notifications and motion snapshots.
-- **Battery monitoring:** the Home app will notify you if the battery level of one of your sensors is low.
-
-Here are some example screenshots:
-
-<img alt="Sensors" src="https://raw.githubusercontent.com/nzapponi/homebridge-simplisafe3/master/docs/sensors.png" width="50%"><img alt="Alarm controls" src="https://raw.githubusercontent.com/nzapponi/homebridge-simplisafe3/master/docs/arm.png" width="50%">
+- **Live view** of every SimpliSafe camera in the Home app, with audio. Newer cameras (Outdoor Camera, Video Doorbell Series 2) are passed through without transcoding.
+- **Recording** with HomeKit Secure Video, per camera. See [Recording](#recording-homekit-secure-video).
+- **Motion and doorbell** notifications with an image of the event.
+- **Battery level** and charging state of battery cameras.
 
 ## Usage
 
@@ -70,8 +65,7 @@ Install this edited version as described in [Installing alongside the original](
 ```
 {
     "platform": "homebridge-simplisafe3-edited.SimpliSafe 3 Edited",
-    "name": "SimpliSafe Cameras",
-    "camerasOnly": true
+    "name": "SimpliSafe Cameras"
 }
 ```
 
@@ -90,84 +84,50 @@ In 2021, SimpliSafe transitioned to only supporting a protocol called OAuth for 
 
  1. Alternatively the plugin provides a command-line method for authenticating. The process works the same as above and can be run using `homebridge-simplisafe3-edited login`. If you are using a non-standard storage location for Homebridge pass the `-d` argument e.g. `homebridge-simplisafe3-edited login -d /var/lib/homebridge`.
 
-#### Error & Authentication Failure Notifications
-
-- The plugin is designed to persistently and proactively maintain authentication with SimpliSafe but obviously this is not perfect. When authentication with SimpliSafe fails, the plugin sets the [**Status Fault** property](https://developers.homebridge.io/#/characteristic/StatusFault) of the Alarm to `true`. Though you are not able to see this property in the Home app, it can be viewed in other HomeKit apps and you can create automations based on this, for example to send you an email or notification when this happens using the excellent [homebridge-messenger plugin](https://github.com/potrudeau/homebridge-messenger). For more details on an example notification setup see [this discussion](https://github.com/homebridge-simplisafe3/homebridge-simplisafe3/discussions/285#discussioncomment-2008529).
-- The [**Status Fault** property](https://developers.homebridge.io/#/characteristic/StatusFault) will also be set in the event of the plugin failing to set an alarm state either because of auth failure or for example errors communicating with the SimpliSafe API. This can help alert you if the alarm state did not successfully change.
-
 ### Optional Parameters
 
-#### `cameras` and `cameraOptions`
-These enable camera support. See [Camera Support](#camera-support) for more details.
-
-#### `camerasOnly`
-Type: boolean (default `true` in this edited version)
-
-Only add cameras, not the alarm, sensors or locks, and turns on `cameras`. HomeKit sends each bridge's requests one at a time, so running the cameras on their own [child bridge](https://github.com/homebridge/homebridge/wiki/Child-Bridges) means a slow camera can never hold up the alarm. Set it to `false` to use this version for everything instead of the original plugin.
+#### `cameraOptions`
+Camera settings, see [Camera Support](#camera-support).
 
 #### `debug`
 Type: boolean (default `false`)
 
-Switch this on to get more details about your sensors and plugin behavior in your Homebridge logs. This can be useful if you are having trouble or need to report an issue.
+Switch this on to get more details about your cameras and plugin behavior in your Homebridge logs. This can be useful if you are having trouble or need to report an issue.
 
 #### `subscriptionId` (aka Account Number)
 Type: string
 
 Add this parameter in case you have multiple protected locations or accounts with SimpliSafe, this is your "account number" in Simplisafe. The best way to ensure you have the correct number is to check under the [SimpliSafe web control panel > View Account](https://webapp.simplisafe.com/#/account) and look for **account #** next to the correct plan. For most users this is the same as the serial number at the bottom of your base unit.
 
-#### `sensorRefresh`
-Type: integer (default `15` seconds)
-
-The frequency with which the plugin will poll sensors (e.g. Entry sensors), since entry sensor changes (opening/closing) are not pushed from SimpliSafe. Warning: setting this value too low will likely lead to your IP address being (temporarily) blocked by SimpliSafe.
-
 #### `persistAccessories`
 Type: boolean (default `true`)
 
-By default, the plugin will persist accessories to avoid losing automations etc. Set this to `false` to remove old accessories that no longer exist in SimpliSafe from HomeKit.
+By default, the plugin will persist accessories to avoid losing automations etc. Set this to `false` to remove cameras that no longer exist in SimpliSafe from HomeKit.
 
 #### `excludedDevices`
 Type: array
 
-Accepts a list of SimpliSafe device serial numbers (which can be found in the SS app) and excludes these devices from HomeKit.
+Accepts a list of SimpliSafe camera serial numbers (which can be found in the SS app) and excludes these cameras from HomeKit.
 
-### Supported Devices
+### Supported Cameras
 
-Device                 | Supported          | Notes
+Camera                 | Supported          | Notes
 ---------------------- | ------------------ | -------------------------------------------------
-Alarm                  | :white_check_mark: | Arming/disarming to home, away and off modes. Sets tamper property on power outage
 SimpliCam              | :white_check_mark: | Audio, video, motion*, no microphone
 Video Doorbell Pro     | :white_check_mark: | Audio, video, motion, no microphone
 Video Doorbell Series 2| :white_check_mark: | Audio, video, motion, no microphone
 Outdoor Camera         | :white_check_mark: | Audio, video, motion, battery level, no microphone. See [Battery cameras](#battery-cameras)
 Wireless Indoor Camera | :grey_question:    | Untested, may work, please [report your findings](https://github.com/homebridge-simplisafe3/homebridge-simplisafe3/discussions/new?category=general)
-Smart lock             | :white_check_mark: | Fully supports locking, unlocking
-Entry sensor           | :white_check_mark: | Status not provided as 'push' by SS so is polled based on `sensorRefresh`
-Smoke detector         | :white_check_mark: | Includes support for tamper & fault
-CO detector            | :white_check_mark: | Includes support for tamper & fault
-Water sensor           | :white_check_mark: |
-Freeze sensor          | :white_check_mark: | Supports temperature readings, not sensor trigger
-Motion sensor          | :white_check_mark: | Requires motion sensor set to "Secret Alert" or "Alarm" in SimpliSafe settings**
-Glassbreak sensor      | :x:                | State not provided by SimpliSafe
-Keypad                 | :x:                | State not provided by SimpliSafe
-Panic button           | :x:                | State not provided by SimpliSafe
 
 \* SimpliCams provide motion notifications only if the privacy shutter is open.
 
-\** The default SimpliSafe settings for motion sensors are "Disabled" when alarm is "Off" or "Home", in which case motion events will not be accurate since they won't always trigger. For consistency of the Home app, motion sensors need to be switched to either "Secret Alert" or "Alarm" in **every** alarm mode for the sensors to appear in the app.
-For example, setting the motion sensor to Secret Alert in Off and Home mode and Alarm in Away mode **will** display it in the Home app, whereas setting it to Disabled in Off mode, Secret Alert in Home mode and Alarm in Away mode **won't**, since the sensor state and automations in the Home app would be inaccurate.
-Using the "Secret Alert" setting will allow for motion events at all times but note that [this will also record a video clip](https://simplisafe.com/forum/customer-support-forum/installing-and-using-simplisafe/secret-alert-triggers-camera) when motion events are triggered.
-
-All devices also support low battery warnings.
-
 ### Camera Support
-To enable camera support, simply switch `"cameras": true` in your `config.json` (or set via Config UI X admin).
-
 Cameras stream one of two ways depending on the model. The SimpliCam and Video Doorbell Pro use SimpliSafe's original streaming endpoint and are transcoded with ffmpeg. Newer cameras such as the Video Doorbell Series 2 stream over SimpliSafe's LiveKit service, and their H.264 video is passed through to HomeKit untouched, so no video transcoding happens at all (audio is still converted).
 
 Only the SimpliCam, Video Doorbell Pro and Video Doorbell Series 2 have been tested against real hardware. Other newer cameras may work if SimpliSafe streams them the same way, and [#240](https://github.com/homebridge-simplisafe3/homebridge-simplisafe3/discussions/240) is the place to report whether they do.
 
 #### Snapshots
-HomeKit sends a bridge's requests one at a time: camera snapshots, starting a live view, and alarm and lock commands all wait for the request before them. Fetching a new snapshot takes a few seconds (longer if a battery camera has to wake up), so the plugin answers snapshot requests straight away with the most recent image and refreshes it in the background. Tiles in the Home app may therefore show an image that is a few seconds old (a few minutes for battery cameras). Doorbell and motion notifications always wait briefly for a new image. For Outdoor Cameras that image is SimpliSafe's own image of the event when it is ready within 3 seconds (usually under 1), which saves waking the camera; set `eventImages` to `false` to always ask the camera instead. The last image of each camera is kept on disk so tiles show something straight after a restart.
+HomeKit sends a bridge's requests one at a time: camera snapshots and starting a live view all wait for the request before them. Fetching a new snapshot takes a few seconds (longer if a battery camera has to wake up), so the plugin answers snapshot requests straight away with the most recent image and refreshes it in the background. Tiles in the Home app may therefore show an image that is a few seconds old (a few minutes for battery cameras). Doorbell and motion notifications always wait briefly for a new image. For Outdoor Cameras that image is SimpliSafe's own image of the event when it is ready within 3 seconds (usually under 1), which saves waking the camera; set `eventImages` to `false` to always ask the camera instead. The last image of each camera is kept on disk so tiles show something straight after a restart.
 
 #### Recording (HomeKit Secure Video)
 HomeKit can record cameras listed in `record` (Advanced Camera Settings), by the names used in the SimpliSafe app. After restarting Homebridge, choose **Stream & Allow Recording** for each of them in the Home app. This needs a home hub (Apple TV or HomePod) and an iCloud+ plan: 50 GB covers one camera, 200 GB five, 2 TB any number. The cameras stay paired, recording is added to them; remove a camera from the list to take recording away again.

@@ -5,38 +5,16 @@ import EventEmitter from 'events';
 import { AUTH_EVENTS } from './lib/authManager';
 import { eventShape } from './lib/diagnosticLines';
 
-export const VALID_ALARM_STATES = [
-    'off',
-    'home',
-    'away'
-];
-
-export const VALD_LOCK_STATES = [
-    'lock',
-    'unlock'
-];
-
+// The devices an arm or disarm event can come from that tell which state the alarm is in
 export const SENSOR_TYPES = {
     'APP': 0,
     'KEYPAD': 1,
     'KEYCHAIN': 2,
-    'PANIC_BUTTON': 3,
-    'MOTION_SENSOR': 4,
-    'ENTRY_SENSOR': 5,
-    'GLASSBREAK_SENSOR': 6,
-    'CO_SENSOR': 7,
-    'SMOKE_SENSOR': 8,
-    'WATER_SENSOR': 9,
-    'FREEZE_SENSOR': 10,
-    'SIREN': 11,
-    'SIREN_2': 13,
     'DOORLOCK': 16,
-    // cameras paired to the base station are listed as sensors too, they are set up from the camera list
-    'OUTDOOR_CAMERA': 17,
-    'OUTDOOR_CAMERA_2': 23,
     'DOORLOCK_2': 253
 };
 
+// The alarm events are only used to know whether a SimpliCam's privacy shutter is open
 export const EVENT_TYPES = {
     ALARM_TRIGGER: 'ALARM_TRIGGER',
     ALARM_OFF: 'ALARM_OFF',
@@ -46,16 +24,10 @@ export const EVENT_TYPES = {
     HOME_ARM: 'HOME_ARM',
     AWAY_EXIT_DELAY: 'AWAY_EXIT_DELAY',
     AWAY_ARM: 'AWAY_ARM',
+    // motion reported like a sensor's, e.g. by an Outdoor Camera paired to the base station
     MOTION: 'MOTION',
-    ENTRY: 'ENTRY',
     CAMERA_MOTION: 'CAMERA_MOTION',
     DOORBELL: 'DOORBELL',
-    DOORLOCK_LOCKED: 'DOORLOCK_LOCKED',
-    DOORLOCK_UNLOCKED: 'DOORLOCK_UNLOCKED',
-    DOORLOCK_ERROR: 'DOORLOCK_ERROR',
-    POWER_OUTAGE: 'POWER_OUTAGE',
-    POWER_RESTORED: 'POWER_RESTORED',
-    USER_INITIATED_TEST: 'USER_INITIATED_TEST',
     // a camera woke up, went to sleep, went offline or came back
     CAMERA_STATUS: 'CAMERA_STATUS',
 };
@@ -75,12 +47,8 @@ export class RateLimitError extends Error {
 }
 
 const subscriptionCacheTime = 3000; // ms
-const sensorCacheTime = 3000; // ms
 const rateLimitInitialInterval = 60000; // ms
 const rateLimitMaxInterval = 2 * 60 * 60 * 1000; // ms
-const sensorRefreshLockoutDuration = 20000; // ms
-const errorSuppressionDuration = 5 * 60 * 1000; // ms
-const alarmRefreshInterval = 62000; // ms, avoid overlap with sensor refresh
 const alarmStateTrustTime = 10000; // ms an alarm state is relied on for the privacy shutter before asking again
 const apiTimeout = 30000; // ms
 const appHubTimeout = 15000; // ms
@@ -112,17 +80,6 @@ class SimpliSafe3 extends EventEmitter {
     accountNumber;
     socket;
     lastSubscriptionRequests = {};
-    lastSensorRequest;
-    lastLockRequest;
-    alarmRefreshIntervalID;
-    alarmSubscriptions = [];
-    sensorRefreshIntervalID;
-    sensorRefreshTime;
-    refreshLockoutTimeoutID;
-    refreshLockoutEnabled = false;
-    sensorSubscriptions = [];
-    errorSupperessionTimeoutID;
-    nSuppressedErrors;
     storagePath;
     nSocketConnectFailures = 0;
     socketHeartbeatIntervalID;
@@ -136,9 +93,8 @@ class SimpliSafe3 extends EventEmitter {
     lastAlarmEventAt = 0;
     alarmStateRefresh = null;
 
-    constructor(sensorRefreshTime = 15000, authManager, storagePath, log, debug) {
+    constructor(authManager, storagePath, log, debug) {
         super();
-        this.sensorRefreshTime = sensorRefreshTime;
         this.log = log || console.log;
         this.debug = debug;
         this.storagePath = storagePath;
@@ -151,7 +107,7 @@ class SimpliSafe3 extends EventEmitter {
 
         this.resetRateLimitHandler();
 
-        // every camera and sensor listens for events
+        // every camera listens for events
         this.setMaxListeners(100);
         this.trackAlarmState();
     }
@@ -335,7 +291,7 @@ class SimpliSafe3 extends EventEmitter {
                 throw new Error('No matching monitoring plans found. Check your account and ensure you have an active plan.');
             } else {
                 let accountNumbers = subs.map(s => s.location.account);
-                throw new Error(`Multiple accounts found. You must specify an account number in the plugin settings. See README https://github.com/homebridge-simplisafe3/homebridge-simplisafe3#subscriptionid-account-number for more info. The account numbers found were: ${accountNumbers.join(', ')}.`);
+                throw new Error(`Multiple accounts found. You must specify an account number in the plugin settings. See README https://github.com/williamorman-oss/Edited-homebridge-simplisafe3#subscriptionid-account-number for more info. The account numbers found were: ${accountNumbers.join(', ')}.`);
             }
         }
 
@@ -382,54 +338,6 @@ class SimpliSafe3 extends EventEmitter {
         } else {
             throw new Error('Subscription format not understood:', subscription);
         }
-    }
-
-    async setAlarmState(newState) {
-        let state = newState.toLowerCase();
-
-        if (VALID_ALARM_STATES.indexOf(state) == -1) {
-            throw new Error('Invalid target state');
-        }
-
-        if (!this.subId) {
-            await this.getSubscription();
-        }
-
-        let data = await this.request({
-            method: 'POST',
-            url: `/ss3/subscriptions/${this.subId}/state/${state}`
-        });
-
-        this.handleSensorRefreshLockout();
-        
-        return data;
-    }
-
-    async getSensors(forceUpdate = false, forceRefresh = false) {
-        if (!this.subId) {
-            await this.getSubscription();
-        }
-
-        if (forceRefresh || !this.lastSensorRequest) {
-            this.lastSensorRequest = await this.request({
-                method: 'GET',
-                url: `/ss3/subscriptions/${this.subId}/sensors?forceUpdate=${forceUpdate ? 'true' : 'false'}`
-            })
-                .then(data => {
-                    return data;
-                })
-                .catch(err => {
-                    throw err;
-                })
-                .finally(() => {
-                    setTimeout(() => {
-                        this.lastSensorRequest = null;
-                    }, sensorCacheTime);
-                });
-        }
-
-        let data = this.lastSensorRequest;
-        return data.sensors;
     }
 
     async getCameras(forceRefresh = false) {
@@ -485,57 +393,6 @@ class SimpliSafe3 extends EventEmitter {
             }
             throw err;
         }
-    }
-
-    async getLocks(forceRefresh) {
-        if (!this.subId) {
-            await this.getSubscription();
-        }
-
-        if (forceRefresh || !this.lastLockRequest) {
-            this.lastLockRequest = await this.request({
-                method: 'GET',
-                url: `/doorlock/${this.subId}`
-            })
-                .then(data => {
-                    return data;
-                })
-                .catch(err => {
-                    throw err;
-                })
-                .finally(() => {
-                    setTimeout(() => {
-                        this.lastLockRequest = null;
-                    }, sensorCacheTime);
-                });
-        }
-
-        let data = this.lastLockRequest;
-        this.refreshLockoutEnabled = data.length > 0;
-        return data;
-
-    }
-
-    async setLockState(lockId, newState) {
-        let state = newState.toLowerCase();
-
-        if (VALD_LOCK_STATES.indexOf(state) == -1) {
-            throw new Error('Invalid target state');
-        }
-
-        if (!this.subId) {
-            await this.getSubscription();
-        }
-
-        let data = await this.request({
-            method: 'POST',
-            url: `/doorlock/${this.subId}/${lockId}/state`,
-            data: {
-                state: state
-            }
-        });
-
-        return data;
     }
 
     async startListening() {
@@ -647,11 +504,8 @@ class SimpliSafe3 extends EventEmitter {
 
                 switch (data.eventType) {
                 case 'alarm':
-                    if (data.eventCid == 1601) {
-                        this.emit(EVENT_TYPES.USER_INITIATED_TEST, data);
-                    } else {
-                        this.emit(EVENT_TYPES.ALARM_TRIGGER, data);
-                    }
+                    // 1601 is a test started by the user
+                    if (data.eventCid != 1601) this.emit(EVENT_TYPES.ALARM_TRIGGER, data);
                     break;
                 case 'alarmCancel':
                     this.emit(EVENT_TYPES.ALARM_OFF, data);
@@ -668,11 +522,9 @@ class SimpliSafe3 extends EventEmitter {
                     case 1407:
                         // 1400 is disarmed with Master PIN, 1407 is disarmed with Remote
                         this.emit(EVENT_TYPES.ALARM_DISARM, data);
-                        this.handleSensorRefreshLockout();
                         break;
                     case 1406:
                         this.emit(EVENT_TYPES.ALARM_CANCEL, data);
-                        this.handleSensorRefreshLockout();
                         break;
                     case 1409:
                         this.emit(EVENT_TYPES.MOTION, data);
@@ -683,7 +535,6 @@ class SimpliSafe3 extends EventEmitter {
                     case 3441:
                     case 3491:
                         this.emit(EVENT_TYPES.HOME_ARM, data);
-                        this.handleSensorRefreshLockout();
                         break;
                     case 9401:
                     case 9407:
@@ -696,10 +547,6 @@ class SimpliSafe3 extends EventEmitter {
                     case 3481:
                         // 3401 is for Keypad, 3407 is for Remote
                         this.emit(EVENT_TYPES.AWAY_ARM, data);
-                        this.handleSensorRefreshLockout();
-                        break;
-                    case 1429:
-                        this.emit(EVENT_TYPES.ENTRY, data);
                         break;
                     case 1110:
                     case 1154:
@@ -713,39 +560,11 @@ class SimpliSafe3 extends EventEmitter {
                     case 1170:
                         this.emit(EVENT_TYPES.CAMERA_MOTION, data);
                         break;
-                    case 1301:
-                        this.emit(EVENT_TYPES.POWER_OUTAGE, data);
-                        break;
-                    case 3301:
-                        this.emit(EVENT_TYPES.POWER_RESTORED, data);
-                        break;
                     case 1458:
                         this.emit(EVENT_TYPES.DOORBELL, data);
                         break;
-                    case 9700:
-                        this.emit(EVENT_TYPES.DOORLOCK_UNLOCKED, data);
-                        break;
-                    case 9701:
-                        this.emit(EVENT_TYPES.DOORLOCK_LOCKED, data);
-                        break;
-                    case 9703:
-                        this.emit(EVENT_TYPES.DOORLOCK_ERROR, data);
-                        break;
-                    case 1350:
-                        this.log.error('Base station WiFi lost, this plugin cannot communicate with the base station until it is restored.');
-                        break;
-                    case 3350:
-                        this.log.warn('Base station WiFi restored.');
-                        break;
-                    case 1601:
-                        // User-initiated test, handled above
-                        break;
-                    case 1602:
-                        // Automatic test
-                        break;
                     default:
-                        // Unknown event
-                        if (this.debug) this.log('Unknown SSAPI event:', data);
+                        // other events are about the sensors and locks, which this plugin does not have
                         break;
                     }
                     break;
@@ -779,116 +598,6 @@ class SimpliSafe3 extends EventEmitter {
         this.nSocketConnectFailures++;
         this.isAwaitingSocketReconnect = true;
     }
-
-    subscribeToSensor(id, callback) {
-        if (!this.sensorRefreshIntervalID) {
-            this.sensorRefreshIntervalID = setInterval(async () => {
-                if (this.sensorSubscriptions.length == 0) {
-                    return;
-                }
-        
-                if (this.refreshLockoutTimeoutID) {
-                    if (this.debug) this.log('Sensor refresh lockout in effect, refresh blocked.');
-                    return;
-                }
-        
-                try {
-                    let sensors = await this.getSensors(true);
-                    for (let sensor of sensors) {
-                        this.sensorSubscriptions
-                            .filter(sub => sub.id === sensor.serial)
-                            .map(sub => sub.callback(sensor));
-                    }
-                } catch (err) {
-                    if (!(err instanceof RateLimitError)) { // never log rate limit errors as they are handled elsewhere
-                        if (this.debug) {
-                            if (err.statusCode == 409) {
-                                this.log.debug('Sensor refresh received SettingsInProgress error from the SimpliSafe API. Note this does not necessarily indicate a problem, just that the base station was busy.');
-                            } else {
-                                this.log.error('Sensor refresh received an error from the SimpliSafe API:', err);
-                            }
-                        } else {
-                            this.handleErrorSuppression();
-                        }
-                    }
-                }
-        
-            }, this.sensorRefreshTime);
-        
-        }
-
-        this.sensorSubscriptions.push({
-            id: id,
-            callback: callback
-        });
-    }
-
-    unsubscribeFromSensor(id) {
-        this.sensorSubscriptions = this.sensorSubscriptions.filter(sub => sub.id !== id);
-        if (this.sensorSubscriptions.length == 0) {
-            clearInterval(this.sensorRefreshIntervalID);
-        }
-    }
-
-    subscribeToAlarmSystem(id, callback) {
-        if (!this.alarmRefreshIntervalID) {
-            this.alarmRefreshIntervalID = setInterval(async () => {
-                if (this.refreshLockoutTimeoutID) {
-                    if (this.debug) this.log('Refresh lockout in effect, alarm system refresh blocked.');
-                    return;
-                }
-
-                try {
-                    let system = await this.getAlarmSystem(true);
-                    this.alarmSubscriptions
-                        .filter(sub => sub.id === system.serial)
-                        .map(sub => sub.callback(system));
-                } catch (err) {
-                    if (!(err instanceof RateLimitError)) { // never log rate limit errors as they are handled elsewhere
-                        if (this.debug) {
-                            if (err.statusCode == 409) {
-                                this.log.warn('Alarm system refresh received a SettingsInProgress error from the SimpliSafe API.');
-                            } else {
-                                this.log.error('Alarm system refresh received an error from the SimpliSafe API:', err);
-                            }
-                        } else {
-                            this.handleErrorSuppression();
-                        }
-                    }
-                }
-
-            }, alarmRefreshInterval);
-
-        }
-
-        this.alarmSubscriptions.push({
-            id: id,
-            callback: callback
-        });
-    }
-
-    handleErrorSuppression() {
-        if (!this.errorSupperessionTimeoutID) {
-            this.nSuppressedErrors = 1;
-            this.errorSupperessionTimeoutID = setTimeout(() => {
-                if (!this.debug && this.nSuppressedErrors > 0) this.log.warn(`${this.nSuppressedErrors} error${this.nSuppressedErrors > 1 ? 's were' : ' was'} received from the SimpliSafe API while refreshing sensors in the last ${errorSuppressionDuration / 60000} minutes. These can usually be ignored if everything is working. Otherwise, enable debug logging for the plugin and restart to see detailed output.`);
-                clearTimeout(this.errorSupperessionTimeoutID);
-                this.errorSupperessionTimeoutID = undefined;
-            }, errorSuppressionDuration);
-        } else {
-            this.nSuppressedErrors++;
-        }
-    }
-
-    handleSensorRefreshLockout() {
-        if (!this.refreshLockoutEnabled) return;
-        // avoid "smart lock not responding" error with refresh lockout, see issue #134
-        clearTimeout(this.refreshLockoutTimeoutID);
-        this.refreshLockoutTimeoutID = setTimeout(() => {
-            this.refreshLockoutTimeoutID = undefined;
-        }, sensorRefreshLockoutDuration);
-    }
-
 }
 
 export default SimpliSafe3;

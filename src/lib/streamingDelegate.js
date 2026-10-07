@@ -273,7 +273,7 @@ class StreamingDelegate {
             if (request.width > this.snapshotWidth) this.snapshotWidth = request.width;
 
             // HomeKit sends a bridge's requests one at a time, so answer from the cache rather than
-            // keep every other camera, live view and the alarm waiting on this camera
+            // keep every other camera and live view waiting on this camera
             const notBefore = this.snapshotNotBefore(request);
             const image = await this.snapshots.get(notBefore, notBefore ? freshSnapshotBudget : snapshotBudget);
             if (image && this.snapshotIsAbandoned()) {

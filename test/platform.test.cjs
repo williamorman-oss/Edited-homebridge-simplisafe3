@@ -13,15 +13,14 @@ function stubAccessory(file, extra = {}) {
             this.args = args;
             this.name = args[0];
             this.id = args[1];
+            this.uuid = `uuid-${args[1]}`;
         }
     };
     Object.assign(Stub.prototype, extra);
     require.cache[modulePath] = { id: modulePath, filename: modulePath, loaded: true, exports: { __esModule: true, default: Stub } };
 }
 
-for (const file of ['alarm', 'entrySensor', 'motionSensor', 'smokeDetector', 'coDetector', 'waterSensor', 'freezeSensor', 'doorLock', 'unreachableAccessory']) {
-    stubAccessory(file);
-}
+stubAccessory('unreachableAccessory');
 stubAccessory('camera', {
     isUnsupported() { return false; },
     updateCameraDetails(details) { this.updated = details; },
@@ -34,16 +33,15 @@ plugin({
     registerPlatform: (pluginName, platformName, constructor) => { SS3Platform = constructor; },
 });
 
-function createPlatform({ camerasOnly = false, cameraOptions } = {}) {
+function createPlatform({ cameraOptions } = {}) {
     const warnings = [];
+    const errors = [];
     const log = () => {};
-    log.error = () => {};
+    log.error = (...args) => errors.push(args.join(' '));
     log.info = () => {};
     log.warn = (...args) => warnings.push(args.join(' '));
 
     const ctx = Object.assign(Object.create(SS3Platform.prototype), {
-        camerasOnly,
-        enableCameras: true,
         debug: false,
         log,
         excludedDevices: [],
@@ -53,38 +51,36 @@ function createPlatform({ camerasOnly = false, cameraOptions } = {}) {
         authManager: {},
         api: {},
         snapshotDir: '/tmp/snapshots',
+        // only what the cameras need: anything for the alarm, sensors or locks would throw
         simplisafe: {
-            getSubscription: async () => ({ location: { system: { serial: 'base' } } }),
-            getSensors: async () => [
-                { type: 5, serial: 'entry', name: 'Front Door', setting: {} },
-                { type: 17, serial: 'f11a9cfb', name: 'Back Yard', setting: {} },
-                { type: 23, serial: 'f13787bb', name: 'Side Yard', setting: {} },
+            getCameras: async () => [
+                { uuid: 'b26f49e83ed74bbcbbca4d34f13787bb', serial: 'f13787bb', cameraSettings: { cameraName: 'Side Yard' } },
+                { uuid: 'e15534806fb14446be20a948f11a9cfb', serial: 'f11a9cfb', cameraSettings: { cameraName: 'Back Yard' } },
             ],
-            getLocks: async () => [{ serial: 'lock', name: 'Lock' }],
-            getCameras: async () => [{ uuid: 'b26f49e83ed74bbcbbca4d34f13787bb', serial: 'f13787bb', cameraSettings: { cameraName: 'Side Yard' } }],
         },
     });
-    return { ctx, warnings };
+    return { ctx, warnings, errors };
 }
 
-test('discovery sets up outdoor cameras as cameras only, without "not supported" sensor warnings', async () => {
+test('discovery sets up the cameras and nothing else', async () => {
     const { ctx, warnings } = createPlatform();
     await ctx.discoverSimpliSafeDevices();
 
-    assert.deepEqual(ctx.devices.map((device) => device.kind).sort(), ['alarm', 'camera', 'doorLock', 'entrySensor']);
+    assert.deepEqual(ctx.devices.map((device) => [device.kind, device.name]), [['camera', 'Side Yard'], ['camera', 'Back Yard']]);
+    assert.deepEqual(ctx.devices[0].args.at(-1), { snapshotDir: '/tmp/snapshots', recording: { enabled: false, alwaysConnected: false } });
     assert.deepEqual(warnings, []);
 });
 
-test('camerasOnly discovers just the cameras', async () => {
-    const { ctx } = createPlatform({ camerasOnly: true });
+test('an excluded camera is left out', async () => {
+    const { ctx } = createPlatform();
+    ctx.excludedDevices = ['f11a9cfb'];
     await ctx.discoverSimpliSafeDevices();
 
-    assert.deepEqual(ctx.devices.map((device) => device.kind), ['camera']);
-    assert.deepEqual(ctx.devices[0].args.at(-1), { snapshotDir: '/tmp/snapshots', recording: { enabled: false, alwaysConnected: false } });
+    assert.deepEqual(ctx.devices.map((device) => device.name), ['Side Yard']);
 });
 
 test('recording is switched on per camera by name, and always connected only for cameras that record', async () => {
-    const { ctx } = createPlatform({ camerasOnly: true, cameraOptions: { record: [' side yard ', 'Front Door'], alwaysConnected: ['Side Yard', 'Back Yard'] } });
+    const { ctx } = createPlatform({ cameraOptions: { record: [' side yard ', 'Front Door'], alwaysConnected: ['Side Yard', 'Back Yard'] } });
     await ctx.discoverSimpliSafeDevices();
     assert.deepEqual(ctx.devices[0].args.at(-1).recording, { enabled: true, alwaysConnected: true });
 
@@ -93,7 +89,7 @@ test('recording is switched on per camera by name, and always connected only for
 });
 
 test('camera details from a system refresh reach the camera', async () => {
-    const { ctx } = createPlatform({ camerasOnly: true });
+    const { ctx } = createPlatform();
     await ctx.discoverSimpliSafeDevices();
 
     const details = { uuid: 'b26f49e83ed74bbcbbca4d34f13787bb', cameraStatus: { batteryPercentage: 42 } };
@@ -102,22 +98,69 @@ test('camera details from a system refresh reach the camera', async () => {
     assert.equal(ctx.devices[0].updated, details);
 });
 
-test('this edition only adds cameras unless told otherwise', () => {
+function cachedAccessory(UUID, displayName, serviceUUIDs) {
+    return { UUID, displayName, services: serviceUUIDs.map((uuid) => ({ UUID: uuid })) };
+}
+
+test('a cached accessory that is not a camera is kept but not set up, and a camera is', async () => {
+    const { ctx, warnings } = createPlatform();
+    ctx.persistAccessories = true;
+    ctx.simplisafe.isBlocked = false;
+    ctx.authManager = { isAuthenticated: () => true };
+    ctx.api = { hap: { Service: { CameraRTPStreamManagement: { UUID: 'camera-rtp' } } }, unregisterPlatformAccessories: () => assert.fail('nothing is removed while accessories persist') };
+    ctx.cachedAccessoryConfig = [];
+    ctx.initialLoad = ctx.discoverSimpliSafeDevices();
+
+    const camera = cachedAccessory('uuid-b26f49e83ed74bbcbbca4d34f13787bb', 'Side Yard', ['camera-rtp']);
+    let configured = null;
+    await ctx.initialLoad;
+    ctx.devices[0].setAccessory = (accessory) => { configured = accessory; };
+
+    ctx.configureAccessory(camera);
+    ctx.configureAccessory(cachedAccessory('uuid-alarm', 'SimpliSafe 3', ['security-system']));
+    await Promise.all(ctx.cachedAccessoryConfig);
+
+    assert.equal(configured, camera);
+    assert.deepEqual(ctx.accessories, [camera]);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /'SimpliSafe 3' is kept but no longer updated, this plugin only has cameras/);
+});
+
+test('a camera another plugin on the same bridge already has is explained', () => {
+    const { ctx, errors } = createPlatform();
+    ctx.devices = [{ name: 'Side Yard', uuid: 'uuid-1', createAccessory: () => ({ UUID: 'uuid-1' }) }];
+    ctx.api = {
+        registerPlatformAccessories: () => {
+            throw new Error('Cannot add a bridged Accessory with the same UUID as another bridged Accessory: uuid-1');
+        },
+    };
+
+    ctx.createNewPlatformAccessories();
+
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Could not add 'Side Yard': this bridge already has it, probably from homebridge-simplisafe3/);
+    assert.deepEqual(ctx.accessories, []);
+});
+
+test('the platform only takes camera settings', () => {
     const fs = require('node:fs');
     const os = require('node:os');
     const storage = fs.mkdtempSync(path.join(os.tmpdir(), 'ss3-platform-'));
+    const warnings = [];
     const log = () => {};
     log.error = () => {};
+    log.warn = (...args) => warnings.push(args.join(' '));
     const api = { user: { storagePath: () => storage }, on: () => {}, hap: { uuid: { generate: (id) => id } } };
 
     try {
-        const byDefault = new SS3Platform(log, { name: 'SimpliSafe Cameras' }, api);
-        assert.equal(byDefault.camerasOnly, true);
-        assert.equal(byDefault.enableCameras, true);
+        const platform = new SS3Platform(log, { name: 'SimpliSafe Cameras', logsForClaude: false }, api);
+        assert.equal(platform.camerasOnly, undefined);
+        assert.deepEqual(warnings, []);
 
-        const everything = new SS3Platform(log, { name: 'SimpliSafe', camerasOnly: false }, api);
-        assert.equal(everything.camerasOnly, false);
-        assert.equal(everything.enableCameras, false);
+        // an older setting that asked for the alarm and sensors as well is pointed at the original plugin
+        new SS3Platform(log, { name: 'SimpliSafe', camerasOnly: false, sensorRefresh: 30, logsForClaude: false }, api);
+        assert.equal(warnings.length, 1);
+        assert.match(warnings[0], /only adds cameras/);
     } finally {
         fs.rmSync(storage, { recursive: true, force: true });
     }

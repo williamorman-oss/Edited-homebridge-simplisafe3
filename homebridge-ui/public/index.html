@@ -120,7 +120,7 @@ const copyLogs = () => {
   // get the current homebridge config
   const pluginConfig = await homebridge.getPluginConfig();
   if (!pluginConfig.length) {
-      pluginConfig.push({ name: 'SimpliSafe Cameras', cameras: true, camerasOnly: true });
+      pluginConfig.push({ name: 'SimpliSafe Cameras' });
       await homebridge.updatePluginConfig(pluginConfig);
   }
 

@@ -1,6 +1,10 @@
 # Change Log
 All notable changes are documented here.
 
+## Unreleased
+- Cameras only: the alarm, sensors and locks are no longer part of this plugin, along with the `cameras`, `camerasOnly` and `sensorRefresh` settings. They are for homebridge-simplisafe3, with its cameras turned off. Cameras already paired stay paired, with their recording settings and automations. The alarm state is still read, never changed, for the SimpliCam's privacy shutter
+- If a camera cannot be added because homebridge-simplisafe3 already has it on the same bridge, the log says so and how to fix it
+
 ## 1.12.0-beta.7, homebridge-simplisafe3-edited (2026-10-07)
 Install, or update an earlier beta, next to the original plugin (see the README):
 ```

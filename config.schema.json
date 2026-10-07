@@ -2,7 +2,7 @@
   "pluginAlias": "homebridge-simplisafe3-edited.SimpliSafe 3 Edited",
   "pluginType": "platform",
   "singular": true,
-  "headerDisplay": "*Please note this plugin requires an active SimpliSafe 'interactive' monitoring plan.* This edited version runs alongside homebridge-simplisafe3 with its own SimpliSafe login. Enable it as a child bridge (Bridge Settings) and pair that bridge in the Home app.",
+  "headerDisplay": "*Please note this plugin requires an active SimpliSafe 'interactive' monitoring plan.* This plugin only adds SimpliSafe cameras, and runs alongside homebridge-simplisafe3 (for the alarm, sensors and locks) with its own SimpliSafe login. Enable it as a child bridge (Bridge Settings), pair that bridge in the Home app, and turn off cameras in homebridge-simplisafe3.",
   "customUi": true,
   "schema": {
     "type": "object",
@@ -14,18 +14,6 @@
         "default": "SimpliSafe Cameras",
         "placeholder": "e.g. SimpliSafe Cameras"
       },
-      "cameras": {
-        "title": " Cameras",
-        "type": "boolean",
-        "default": true,
-        "description": "Enable camera support."
-      },
-      "camerasOnly": {
-        "title": " Cameras Only",
-        "type": "boolean",
-        "default": true,
-        "description": "Only add cameras, not the alarm, sensors or locks. Use this to run the cameras on their own child bridge, so camera snapshots never hold up the alarm."
-      },
       "debug": {
         "title": " Debug",
         "type": "boolean"
@@ -33,11 +21,6 @@
       "subscriptionId": {
         "title": "Account Number",
         "type": "string"
-      },
-      "sensorRefresh": {
-        "title": "Sensor Refresh Interval",
-        "type": "integer",
-        "default": 15
       },
       "persistAccessories": {
         "title": " Persist Accessories",
@@ -92,34 +75,22 @@
           "ffmpegPath": {
             "title": "ffmpeg Path",
             "type": "string",
-            "placeholder": "/path/to/custom/ffmpeg",
-            "condition": {
-              "functionBody": "return (model.cameras || model.camerasOnly)"
-            }
+            "placeholder": "/path/to/custom/ffmpeg"
           },
           "sourceOptions": {
             "title": "Source Options",
             "type": "string",
-            "placeholder": "e.g. -vcodec h264_mmal",
-            "condition": {
-              "functionBody": "return (model.cameras || model.camerasOnly)"
-            }
+            "placeholder": "e.g. -vcodec h264_mmal"
           },
           "videoOptions": {
             "title": "Video Options",
             "type": "string",
-            "placeholder": "e.g. -vcodec h264_omx -tune false",
-            "condition": {
-              "functionBody": "return (model.cameras || model.camerasOnly)"
-            }
+            "placeholder": "e.g. -vcodec h264_omx -tune false"
           },
           "audioOptions": {
             "title": "Audio Options",
             "type": "string",
-            "placeholder": "e.g. -ar 256k",
-            "condition": {
-              "functionBody": "return (model.cameras || model.camerasOnly)"
-            }
+            "placeholder": "e.g. -ar 256k"
           }
         }
       },
@@ -127,7 +98,7 @@
         "type": "array",
         "items": {
           "type": "string",
-          "description": "Serial Number"
+          "description": "Camera Serial Number"
         }
       }
     }
@@ -135,18 +106,13 @@
   "layout": [{
       "type": "fieldset",
       "items": [
-        "name",
-        "cameras",
-        "camerasOnly"
+        "name"
       ]
     },
     {
       "type": "fieldset",
       "expandable": true,
       "title": "Advanced Camera Settings",
-			"condition": {
-				"functionBody": "return (model.cameras || model.camerasOnly)"
-			},
       "items": [
         "cameraOptions.record",
         "cameraOptions.alwaysConnected",
@@ -173,20 +139,19 @@
           "key": "subscriptionId",
           "description": "Find your account number under SS web control panel > View Account. See README for more info."
         },
-        "sensorRefresh",
         {
           "key": "logsForClaude",
           "description": "Keep this plugin's recent log lines, without passwords, tokens or account numbers, for the 'Logs for Claude' card on this page. Nothing is sent anywhere."
         },
         {
           "key": "persistAccessories",
-          "description": "By default, the plugin won't remove old accessories from the Home app. This is to avoid caching issues causing you to lose all your scenes & automations configurations. If you do want to remove old accessories, set this to false."
+          "description": "By default, the plugin won't remove cameras from the Home app that SimpliSafe no longer lists. This is to avoid caching issues causing you to lose all your scenes & automations configurations. If you do want to remove old cameras, set this to false."
         },
         {
           "key": "excludedDevices",
-          "title": "Excluded Devices",
-          "description": "A list of devices to exclude from HomeKit. Uses the device serial number which can be found in the SS app.",
-          "add": "Add Another Device",
+          "title": "Excluded Cameras",
+          "description": "Cameras to leave out of HomeKit, by the serial number shown in the SimpliSafe app.",
+          "add": "Add Another Camera",
           "type": "array",
           "items": [
             {
