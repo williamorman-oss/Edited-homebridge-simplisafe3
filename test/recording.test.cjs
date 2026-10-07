@@ -6,7 +6,7 @@ const path = require('node:path');
 const dgram = require('node:dgram');
 const { EventEmitter } = require('node:events');
 const { spawn, spawnSync } = require('node:child_process');
-const { RtpPacket } = require('werift');
+const { RtpPacket, RtpHeader } = require('werift');
 
 const { LiveKitRecordingSource, FlvRecordingSource, recordingOptions } = require('../dist/lib/recording');
 const RecordingDelegate = require('../dist/lib/recordingDelegate').default;
@@ -119,6 +119,47 @@ test('without recording audio the MP4 has no audio track', { timeout: 60000 }, (
         fake.stop();
     }
 }));
+
+// A source past its keyframe, with what it sends to ffmpeg captured instead of sent
+function sendingSource() {
+    const camera = new EventEmitter();
+    const source = new LiveKitRecordingSource({ name: 'Back Yard', log, debug: false, ffmpegPath: ffmpeg, audio: true }, {
+        acquire: () => ({ source: camera, ready: new Promise(() => {}) }),
+        release: () => {},
+    });
+    const sent = [];
+    source.start();
+    source.ports = { video: 1, audio: 2 };
+    source.socket = { send: (data, port) => sent.push({ port, rtp: RtpPacket.deSerialize(data) }), close() {} };
+    const packet = (kind, sequenceNumber, ssrc = 7) => camera.emit(kind, new RtpPacket(new RtpHeader({ payloadType: kind === 'video' ? 102 : 111, ssrc, sequenceNumber, timestamp: 1000 }), Buffer.from([sequenceNumber & 0xff])));
+    return { source, sent, packet };
+}
+
+test('late and repeated packets keep the camera\'s order for ffmpeg, numbered from the first one sent', () => {
+    const { source, sent, packet } = sendingSource();
+    // a retransmitted packet after the ones that followed it, and one that came twice, across the wrap
+    for (const sequenceNumber of [65533, 65535, 0, 65534, 1, 1, 65535]) packet('video', sequenceNumber);
+    packet('audio', 500);
+    packet('audio', 502);
+    assert.deepEqual(sent.filter((p) => p.port === 1).map((p) => p.rtp.header.sequenceNumber), [1, 3, 4, 2, 5]);
+    assert.deepEqual(sent.filter((p) => p.port === 1).map((p) => p.rtp.payload[0]), [0xfd, 0xff, 0, 0xfe, 1]);
+    // audio has its own numbering, with the lost packet left as a gap
+    assert.deepEqual(sent.filter((p) => p.port === 2).map((p) => p.rtp.header.sequenceNumber), [1, 3]);
+    assert.equal(source.ended, false);
+    source.end('test over');
+});
+
+test('a new stream from the camera ends the source rather than breaking the recording\'s timeline', () => {
+    const { source, sent, packet } = sendingSource();
+    let reason = null;
+    source.on('end', (r) => { reason = r; });
+    packet('video', 100);
+    packet('video', 101);
+    packet('video', 9000, 8); // published again: new SSRC and numbering
+    packet('video', 9001, 8);
+    assert.equal(reason, 'the camera started a new video stream');
+    assert.equal(sent.length, 2);
+});
 
 test('the Doorbell Pro\'s FLV is fetched from media.simplisafe.com with the login and copied as it is', { timeout: 60000 }, () => withDir(async (dir) => {
     // what media.simplisafe.com sends: H.264 Main full range at 20 fps with a keyframe every 2s, AAC-LC 16 kHz mono

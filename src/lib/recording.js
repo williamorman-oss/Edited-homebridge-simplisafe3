@@ -155,7 +155,7 @@ export class LiveKitRecordingSource extends RecordingSource {
         this.queue = null; // packets waiting for ffmpeg to open its ports
         this.socket = null;
         this.ports = null;
-        this.sequence = { video: 0, audio: 0 };
+        this.streams = {}; // per kind: the camera's SSRC, where its numbering starts and the numbers sent lately
     }
 
     start() {
@@ -231,7 +231,8 @@ export class LiveKitRecordingSource extends RecordingSource {
         if (this.audio) output.push('-map', '0:a:0?', '-c:a', 'aac', '-profile:a', 'aac_low', '-ar', '16000', '-ac', '1', '-b:a', '32k');
         else output.push('-an');
 
-        const cmd = this.spawnFfmpeg(['-protocol_whitelist', 'pipe,udp,rtp', '-analyzeduration', '500000', '-probesize', '200000', '-f', 'sdp', '-i', 'pipe:0'], output);
+        // -max_delay: how long ffmpeg waits for a late (retransmitted) packet before skipping the gap
+        const cmd = this.spawnFfmpeg(['-protocol_whitelist', 'pipe,udp,rtp', '-max_delay', '300000', '-analyzeduration', '500000', '-probesize', '200000', '-f', 'sdp', '-i', 'pipe:0'], output);
         cmd.stdin.end(sdp);
 
         await new Promise(resolve => setTimeout(resolve, ffmpegStartDelay));
@@ -243,12 +244,25 @@ export class LiveKitRecordingSource extends RecordingSource {
     }
 
     send(kind, rtp) {
-        // plain RTP for ffmpeg, own sequence numbers so packets dropped before the keyframe are not a gap
-        this.sequence[kind] = (this.sequence[kind] + 1) & 0xffff;
+        const { ssrc, sequenceNumber } = rtp.header;
+        if (!this.streams[kind]) this.streams[kind] = { ssrc, base: sequenceNumber - 1, recent: [] };
+        const stream = this.streams[kind];
+        // the camera published again: new numbering and timestamps would break ffmpeg's timeline,
+        // a new source starts clean from the new stream's keyframe
+        if (ssrc !== stream.ssrc) {
+            this.end(`the camera started a new ${kind} stream`);
+            return;
+        }
+        // a packet that came twice, e.g. retransmitted although it had arrived: ffmpeg would use it twice
+        const slot = sequenceNumber % 1024;
+        if (stream.recent[slot] === sequenceNumber) return;
+        stream.recent[slot] = sequenceNumber;
+        // plain RTP for ffmpeg. The camera's own numbering, so ffmpeg puts a late (retransmitted) packet back
+        // in its place, counted from the first packet sent so packets dropped before the keyframe are not a gap
         const header = new RtpHeader({
             ...rtp.header,
             payloadType: kind === 'video' ? 96 : 111,
-            sequenceNumber: this.sequence[kind],
+            sequenceNumber: (sequenceNumber - stream.base) & 0xffff,
             extension: false,
             extensions: [],
             padding: false,

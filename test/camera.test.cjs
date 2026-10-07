@@ -196,6 +196,22 @@ test('the battery service reports level, low battery and charging', () => {
     assert.equal(camera.cameraDetails.cameraStatus.batteryPercentage, 100);
 });
 
+test('the recording is told when the camera starts or stops charging', () => {
+    let changes = 0;
+    const camera = Object.assign(Object.create(SS3Camera.prototype), {
+        cameraDetails: { supportedFeatures: { battery: true }, currentState: { batteryCharging: true } },
+        recording: { powerChanged: () => changes++ },
+    });
+    const details = (charging) => ({ supportedFeatures: { battery: true }, cameraStatus: { batteryPercentage: 90 }, currentState: { batteryCharging: charging } });
+    camera.updateCameraDetails(details(true));
+    assert.equal(changes, 0, 'no change, nothing to do');
+    camera.updateCameraDetails(details(false));
+    assert.equal(changes, 1);
+    camera.updateCameraDetails(details(false));
+    camera.updateCameraDetails(details(true));
+    assert.equal(changes, 2);
+});
+
 test('a sleeping battery camera reads as asleep in the logs, not just offline', () => {
     const camera = (details) => Object.assign(Object.create(SS3Camera.prototype), { name: 'Back Yard', cameraDetails: details });
 

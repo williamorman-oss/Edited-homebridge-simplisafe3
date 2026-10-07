@@ -122,6 +122,46 @@ test('a running session that dies tells every user once, after closing', () => {
     assert.deepEqual(ended, [['first', 'signalling closed', true], ['second', 'signalling closed', true]]);
 });
 
+test('a session whose video stops without LiveKit ending it is ended, so its users and the next join do not wait on it', async () => {
+    const source = new LiveKitSource(createCamera());
+    source.stallTimeout = 300;
+    const receive = joinWithTracks(source);
+    const ended = [];
+    source.on('ended', (reason) => ended.push([reason, source.closed]));
+    const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    receive.video({ header: { ssrc: 77 }, payload: Buffer.alloc(0) }); // padding, not video
+    assert.equal(source.stallTimerID, null, 'not watched before any video');
+    for (let i = 0; i < 5; i++) {
+        receive.video({ header: { ssrc: 77 }, payload: Buffer.from([1]) });
+        await wait(40);
+    }
+    assert.deepEqual(ended, [], 'video keeps it open');
+
+    // the camera left the room: its audio may go on, but nothing more is shown or recorded
+    for (let i = 0; i < 10; i++) {
+        receive.audio({ header: { ssrc: 78 }, payload: Buffer.from([2]) });
+        await wait(50);
+    }
+    assert.equal(ended.length, 1);
+    assert.match(ended[0][0], /^no video for/);
+    assert.equal(ended[0][1], true, 'closed, so it is not handed out again');
+    assert.equal(source.stallTimerID, null);
+});
+
+test('a closed session stops watching for video', async () => {
+    const source = new LiveKitSource(createCamera());
+    source.stallTimeout = 50;
+    const receive = joinWithTracks(source);
+    let ended = 0;
+    source.on('ended', () => ended++);
+    receive.video({ header: { ssrc: 77 }, payload: Buffer.from([1]) });
+    source.close();
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    assert.equal(ended, 0);
+    assert.equal(source.stallTimerID, null);
+});
+
 test('a keyframe is requested from the video receiver for the SSRC seen, at most once a second', async () => {
     const source = new LiveKitSource(createCamera());
     assert.equal(source.requestKeyframe(), false, 'nothing to ask before joining');

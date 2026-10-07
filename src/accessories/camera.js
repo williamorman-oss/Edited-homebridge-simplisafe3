@@ -65,15 +65,22 @@ class SS3Camera extends SimpliSafe3Accessory {
                 alwaysConnected: !!this.recordingOptions.alwaysConnected
             });
             this.controller = this.streamingDelegate.controller;
-            if (this.recording) this.log(`'${this.name}' records in HomeKit${this.recordingOptions.alwaysConnected ? ', always connected' : ''} once 'Stream & Allow Recording' is chosen for it in the Home app`);
+            if (this.recording) this.log(`'${this.name}' records in HomeKit${this.recordingOptions.alwaysConnected ? ', always connected while not on battery' : ''} once 'Stream & Allow Recording' is chosen for it in the Home app`);
         }
 
         this.accessory.configureController(this.controller);
+        if (this.recording) this.streamingDelegate.watchRecordingSettings();
 
         if (!this.accessory.getService(this.api.hap.Service.MotionSensor)) this.accessory.addService(this.api.hap.Service.MotionSensor);
         this.accessory.getService(this.api.hap.Service.MotionSensor)
             .getCharacteristic(this.api.hap.Characteristic.MotionDetected)
             .on('get', callback => this.getState(callback, this.accessory.getService(this.api.hap.Service.MotionSensor), this.api.hap.Characteristic.MotionDetected));
+        // While a recording camera is Off in HomeKit its motion sensor is inactive. Once recording is taken away
+        // nothing would make it active again
+        const motionService = this.accessory.getService(this.api.hap.Service.MotionSensor);
+        if (!this.recording && motionService.testCharacteristic(this.api.hap.Characteristic.StatusActive)) {
+            motionService.updateCharacteristic(this.api.hap.Characteristic.StatusActive, true);
+        }
 
         // add doorbell after configureController as HKSV creates it own linked motion service
         if (this.isDoorbell()) {
@@ -114,8 +121,11 @@ class SS3Camera extends SimpliSafe3Accessory {
     // Takes newer camera details, e.g. battery level and charging state, from a periodic refresh
     updateCameraDetails(cameraDetails) {
         if (!cameraDetails) return;
+        const wasCharging = this.isCharging();
         this.cameraDetails = cameraDetails;
         this.updateBatteryService();
+        // an always connected camera is let go while on battery
+        if (this.recording && this.isCharging() !== wasCharging) this.recording.powerChanged();
     }
 
     updateBatteryService() {

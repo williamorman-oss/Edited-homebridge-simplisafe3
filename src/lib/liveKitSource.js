@@ -14,6 +14,7 @@ import { liveKitJoin, liveKitLeave, liveKitRequestResponse, participants } from 
 
 const trackTimeout = 30000; // ms, how long a live view waits for the camera's video
 const keyframeRequestInterval = 1000; // ms, at most one keyframe request a second
+const videoStallTimeout = 10000; // ms without video before a running session counts as dead
 
 // LiveKit subscriber. werift gives the encoded RTP so H.264 can be passed to HomeKit untouched.
 // Emits 'video' and 'audio' with every RTP packet, so a snapshot and live views can share one connection,
@@ -36,6 +37,9 @@ class LiveKitSource extends EventEmitter {
         this.videoSsrc = null;
         this.lastKeyframeRequest = 0;
         this.keyframeRequestID = null;
+        this.stallTimeout = videoStallTimeout;
+        this.lastVideoAt = 0;
+        this.stallTimerID = null;
 
         // what the camera sends, logged once per connection
         this.videoFormat = null;
@@ -251,6 +255,10 @@ class LiveKitSource extends EventEmitter {
                     this.videoSsrc = rtp.header.ssrc;
                     if (this.videoStartedAt === null) this.videoStartedAt = Date.now();
                     this.videoBytes += rtp.payload ? rtp.payload.length : 0;
+                    if (rtp.payload && rtp.payload.length) {
+                        this.lastVideoAt = Date.now();
+                        if (!this.stallTimerID) this._watchForStall();
+                    }
                     this._watchVideo(rtp);
                     if (this._onFirstVideo) {
                         const notify = this._onFirstVideo;
@@ -301,6 +309,20 @@ class LiveKitSource extends EventEmitter {
         if (summary === this.lastParticipants) return;
         this.lastParticipants = summary;
         this.log(`LiveKit: ${this.ss3Camera.name} participants: ${summary}`);
+    }
+
+    // LiveKit only ends a session when its signalling stops. A camera that reboots, drops off Wi-Fi or leaves
+    // the room just goes quiet, and the recording, live views and snapshots sharing this connection would wait
+    // on it for good. Ending it closes it for all of them, so the next one joins again
+    _watchForStall() {
+        const left = this.lastVideoAt + this.stallTimeout - Date.now();
+        if (left <= 0) {
+            this.stallTimerID = null;
+            this._sessionEnded(`no video for ${Math.round(this.stallTimeout / 1000)}s`);
+            return;
+        }
+        this.stallTimerID = setTimeout(() => this._watchForStall(), left);
+        if (this.stallTimerID.unref) this.stallTimerID.unref();
     }
 
     // Notes the camera's H.264 profile and level and how often it sends keyframes, which decide whether
@@ -369,6 +391,8 @@ class LiveKitSource extends EventEmitter {
         clearInterval(this.pingIntervalID);
         clearTimeout(this.keyframeRequestID);
         this.keyframeRequestID = null;
+        clearTimeout(this.stallTimerID);
+        this.stallTimerID = null;
         this.streaming = false;
         this.removeAllListeners();
 

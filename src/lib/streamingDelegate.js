@@ -203,10 +203,11 @@ class StreamingDelegate {
             debug: this.ss3Camera.debug,
             hap: hap,
             alwaysConnected: alwaysConnected,
-            // a battery camera is kept awake for the whole recording
-            maxDuration: this.ss3Camera.isBatteryPowered() && !this.ss3Camera.isCharging() ? 60000 : 180000,
+            // read each time, the camera details are refreshed every 10 minutes
+            onBattery: () => this.isOnBattery(),
             createSource: options => this.createRecordingSource(options),
             audioActive: () => this.recordingAudioActive(),
+            cameraActive: () => this.homeKitCameraActive(),
             allowed: async () => !(await this.isPrivacyShutterClosed(true))
         });
         this.recording = recording;
@@ -225,6 +226,23 @@ class StreamingDelegate {
         const management = this.controller && this.controller.recordingManagement;
         if (!management) return true;
         return !!management.recordingManagementService.getCharacteristic(this.api.hap.Characteristic.RecordingAudioActive).value;
+    }
+
+    // Off while the camera is turned off in HomeKit, e.g. 'Off' for the current mode in the Home app
+    homeKitCameraActive() {
+        const management = this.controller && this.controller.recordingManagement;
+        if (!management) return true;
+        return !!management.operatingModeService.getCharacteristic(this.api.hap.Characteristic.HomeKitCameraActive).value;
+    }
+
+    // HAP tells the recording delegate only about 'Stream & Allow Recording', so 'Record Audio' and the camera's
+    // HomeKit on/off are watched here. Their services exist once the controller is configured on the accessory
+    watchRecordingSettings() {
+        const management = this.controller && this.controller.recordingManagement;
+        if (!management || !this.recording) return;
+        const { Characteristic } = this.api.hap;
+        management.recordingManagementService.getCharacteristic(Characteristic.RecordingAudioActive).on('change', () => this.recording.update());
+        management.operatingModeService.getCharacteristic(Characteristic.HomeKitCameraActive).on('change', () => this.recording.update());
     }
 
     createRecordingSource({ audio }) {

@@ -70,6 +70,21 @@ test('switching recording off again removes the recording services and keeps the
     assert.equal(count(restored, hap.Service.CameraRTPStreamManagement), 2);
 });
 
+test('taking recording away while the camera is Off in HomeKit leaves its motion sensor active', async () => {
+    const details = cameraDetails();
+    const recorded = new hap.Accessory('Side Yard', hap.uuid.generate(details.uuid));
+    const cam = camera({ enabled: true }, details);
+    cam.setAccessory(recorded);
+    // Off in the Home app: HAP mirrors it to the motion sensor
+    await cam.controller.recordingManagement.operatingModeService.getCharacteristic(hap.Characteristic.HomeKitCameraActive).handleSetRequest(0);
+    assert.equal(recorded.getService(hap.Service.MotionSensor).getCharacteristic(hap.Characteristic.StatusActive).value, false);
+    const restored = hap.Accessory.deserialize(JSON.parse(JSON.stringify(hap.Accessory.serialize(recorded))));
+
+    camera({ enabled: false }, details).setAccessory(restored);
+    assert.equal(count(restored, hap.Service.CameraOperatingMode), 0);
+    assert.equal(restored.getService(hap.Service.MotionSensor).getCharacteristic(hap.Characteristic.StatusActive).value, true);
+});
+
 test('a motion event starts the camera for a recording and holds the motion sensor on while events continue', async (t) => {
     const timers = useFakeTimers();
     t.after(() => timers.restore());
@@ -89,4 +104,33 @@ test('a motion event starts the camera for a recording and holds the motion sens
     assert.equal(motion.value, true, 'a new event keeps it on');
     timers.tick(5000);
     assert.equal(motion.value, false, 'off 20s after the last event');
+});
+
+test('\'Record Audio\' and turning the camera off or on in the Home app reach the recording', async () => {
+    const details = cameraDetails();
+    const cam = camera({ enabled: true, alwaysConnected: true }, details);
+    const sources = [];
+    cam.streamingDelegate.createRecordingSource = (options) => {
+        const source = Object.assign(new EventEmitter(), { audio: options.audio, ended: false });
+        source.end = (reason) => { if (!source.ended) { source.ended = true; source.emit('end', reason); } };
+        sources.push(source);
+        return source;
+    };
+    cam.setAccessory(new hap.Accessory('Side Yard', hap.uuid.generate(details.uuid)));
+    const { recordingManagementService, operatingModeService } = cam.controller.recordingManagement;
+    const hub = { remoteAddress: 'hub' }; // a write from a HomeKit controller, not from the plugin
+    const write = (service, characteristic, value) => service.getCharacteristic(characteristic).handleSetRequest(value, hub);
+
+    // a hub may turn recording on before it turns on 'Record Audio'
+    await write(recordingManagementService, hap.Characteristic.Active, 1);
+    await write(recordingManagementService, hap.Characteristic.RecordingAudioActive, 1);
+    assert.deepEqual(sources.map((s) => [s.audio, s.ended]), [[false, true], [true, false]]);
+
+    await write(operatingModeService, hap.Characteristic.HomeKitCameraActive, 0);
+    assert.equal(sources[1].ended, true, 'let go while the camera is off');
+    cam.simplisafe.emit('CAMERA_MOTION', { sensorSerial: 'f13787bb' });
+    assert.equal(sources.length, 2, 'motion does not wake it either');
+    await write(operatingModeService, hap.Characteristic.HomeKitCameraActive, 1);
+    assert.equal(sources.length, 3, 'connected again once on');
+    cam.recording.updateRecordingActive(false);
 });
