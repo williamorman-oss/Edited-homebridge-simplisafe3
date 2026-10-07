@@ -4,7 +4,7 @@ All notable changes are documented here.
 ## 1.12.0-beta.7, homebridge-simplisafe3-edited (2026-10-07)
 Install, or update an earlier beta, next to the original plugin (see the README):
 ```
-INSTALL_COMMAND_PENDING
+npm install --prefix /var/lib/homebridge https://github.com/williamorman-oss/Edited-homebridge-simplisafe3/raw/bb20590469000fb6b87e82384cecb4ffc4ad2fd9/releases/homebridge-simplisafe3-edited-1.12.0-beta.7.tgz
 ```
 
 - Fix: Outdoor Camera live view had no sound. The cameras send 100 ms Opus packets timed at 48 kHz, HomeKit only plays packets of the length and rate it asked for. Audio is now re-cut to match, without re-encoding, and only the camera's own audio is passed on (not someone talking from the SimpliSafe app)
