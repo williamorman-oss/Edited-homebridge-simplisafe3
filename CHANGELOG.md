@@ -1,6 +1,18 @@
 # Change Log
 All notable changes are documented here.
 
+## 1.12.0-beta.7, homebridge-simplisafe3-edited (2026-10-07)
+Install, or update an earlier beta, next to the original plugin (see the README):
+```
+INSTALL_COMMAND_PENDING
+```
+
+- Fix: Outdoor Camera live view had no sound. The cameras send 100 ms Opus packets timed at 48 kHz, HomeKit only plays packets of the length and rate it asked for. Audio is now re-cut to match, without re-encoding, and only the camera's own audio is passed on (not someone talking from the SimpliSafe app)
+- Outdoor Camera motion and doorbell notifications show SimpliSafe's own image of the event when it is ready within a few seconds (usually under one), instead of waking the camera. `eventImages: false` turns this off
+- The motion sensor stays on until 5 seconds after the last motion event, rather than 5 seconds after the first
+- New, under review: HomeKit Secure Video recording, off unless cameras are listed in `record` (and optionally `alwaysConnected`), see the README. Best tried once the next beta confirms the review
+- Debug logs: when SimpliSafe says the camera was triggered, each camera's quality layers and the bitrate it sends
+
 ## 1.12.0-beta.6, homebridge-simplisafe3-edited (2026-10-06)
 Install, or update an earlier beta, next to the original plugin (see the README):
 ```
