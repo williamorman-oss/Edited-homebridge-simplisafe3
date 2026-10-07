@@ -48,7 +48,7 @@ const tick = () => new Promise((resolve) => setImmediate(resolve));
 test('a motion event starts the camera, and HomeKit\'s request gets the init segment then everything since', async () => {
     const { recording, sources } = delegate();
     recording.updateRecordingActive(true);
-    recording.prepare();
+    await recording.prepare();
     const source = sources[0];
     source.giveInit();
     source.giveFragment('before HomeKit asked');
@@ -172,7 +172,7 @@ test('an always connected camera that drops reconnects, an on-demand one is let 
 
     const onDemand = delegate();
     onDemand.recording.updateRecordingActive(true);
-    onDemand.recording.prepare();
+    await onDemand.recording.prepare();
     timers.tick(19000);
     assert.equal(onDemand.sources[0].ended, false);
     timers.tick(1000);
@@ -234,7 +234,7 @@ test('an always connected camera on battery is only woken on motion, and kept co
     assert.equal(sources.length, 1);
 
     // motion wakes it like any battery camera, and it is let go after
-    recording.prepare();
+    await recording.prepare();
     assert.equal(sources.length, 2);
     timers.tick(20000);
     assert.equal(sources[1].ended, true);
@@ -261,7 +261,7 @@ test('a recording on battery stops after a minute, one while charging after thre
     const { recording, sources } = delegate({ onBattery: () => onBattery });
     recording.updateRecordingActive(true);
     const lastAfter = async () => {
-        recording.prepare();
+        await recording.prepare();
         const source = sources[sources.length - 1];
         source.giveInit();
         const stream = recording.handleRecordingStreamRequest(1, new AbortController().signal);
@@ -284,12 +284,30 @@ test('a recording on battery stops after a minute, one while charging after thre
 
 test('recording off, or a closed privacy shutter, starts nothing', async () => {
     const { recording, sources } = delegate({ allowed: async () => false });
-    recording.prepare();
+    await recording.prepare();
     assert.equal(sources.length, 0, 'not while recording is off');
     recording.updateRecordingActive(true);
+    await recording.prepare();
+    assert.equal(sources.length, 0, 'not for a motion event while the shutter is closed, e.g. one that arrives after a disarm');
     await assert.rejects(take(recording.handleRecordingStreamRequest(1, new AbortController().signal), 1),
         (err) => err.reason === hap.HDSProtocolSpecificErrorReason.NOT_ALLOWED);
     assert.equal(sources.length, 0);
+});
+
+test('a motion event whose shutter check fails, or ends after recording was turned off, starts nothing', async () => {
+    const failing = delegate({ allowed: async () => { throw new Error('api down'); } });
+    failing.recording.updateRecordingActive(true);
+    await failing.recording.prepare();
+    assert.equal(failing.sources.length, 0);
+
+    let answer;
+    const slow = delegate({ allowed: () => new Promise((resolve) => { answer = resolve; }) });
+    slow.recording.updateRecordingActive(true);
+    const prepared = slow.recording.prepare();
+    slow.recording.updateRecordingActive(false);
+    answer(true);
+    await prepared;
+    assert.equal(slow.sources.length, 0);
 });
 
 test('\'Record Audio\' applies from the next recording: an idle source starts again, one being recorded is kept until it ends', async () => {
@@ -306,7 +324,7 @@ test('\'Record Audio\' applies from the next recording: an idle source starts ag
     await take(stream, 1);
     audio = true;
     recording.update();
-    recording.prepare();
+    await recording.prepare();
     assert.equal(sources.length, 2, 'the recording keeps its source');
     abort.abort();
     await stream.next();
@@ -318,7 +336,7 @@ test('an on-demand recording does not use a source started before \'Record Audio
     let audio = true;
     const { recording, sources } = delegate({ audioActive: () => audio });
     recording.updateRecordingActive(true);
-    recording.prepare();
+    await recording.prepare();
     audio = false;
     const stream = recording.handleRecordingStreamRequest(1, new AbortController().signal);
     const pending = stream.next();

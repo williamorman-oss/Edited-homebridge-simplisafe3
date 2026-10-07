@@ -75,9 +75,17 @@ class RecordingDelegate {
         }
     }
 
-    // A SimpliSafe motion or doorbell event: start the camera now, HomeKit asks a moment later
-    prepare() {
+    // A SimpliSafe motion or doorbell event: start the camera now, HomeKit asks a moment later. Not while
+    // the privacy shutter is closed, e.g. for an event that arrives late, after a disarm closed it
+    async prepare() {
         if (!this.active || !this.cameraActive()) return;
+        let allowed = false;
+        try {
+            allowed = await this.allowed();
+        } catch (e) {
+            // HomeKit's request fails the same way, so there is nothing to start for
+        }
+        if (!allowed || !this.active || !this.cameraActive()) return;
         this.connect();
         this.scheduleIdleStop();
     }

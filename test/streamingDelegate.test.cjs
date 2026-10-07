@@ -114,7 +114,6 @@ function createCameraStub(overrides = {}) {
         supportsPrivacyShutter: () => false,
         isBatteryPowered: () => false,
         isCharging: () => false,
-        motionIsTriggered: false,
         lastEventAt: 0,
         ...overrides,
     };
@@ -288,6 +287,31 @@ test('privacy shutter state follows the alarm state without blocking on errors',
 
     const failed = await requestSnapshot(make(async () => { throw new Error('api down'); }));
     assert.ok(failed[0] instanceof Error, 'errors must reach HomeKit instead of leaving it waiting');
+});
+
+test('a motion event shows the camera for 5s whatever the alarm state, however long the motion sensor stays on', async () => {
+    const make = (lastEventAt) => {
+        const delegate = new StreamingDelegate(createCameraStub({
+            supportsPrivacyShutter: () => true,
+            lastEventAt,
+            // OFF closes the shutter, e.g. disarmed after walking in during AWAY
+            simplisafe: { isBlocked: false, nextAttempt: 0, getCurrentAlarmState: async () => 'OFF' },
+            cameraDetails: {
+                uuid: 'camera-uuid',
+                cameraSettings: { admin: { fps: 20, bitRate: 300 }, pictureQuality: '720p', cameraName: 'Indoor', shutterOff: 'closed', shutterHome: 'closed', shutterAway: 'open' },
+            },
+        }));
+        delegate.snapshots.set(Buffer.from('real-image'));
+        return delegate;
+    };
+
+    const justNow = make(Date.now() - 2000);
+    assert.equal(await justNow.isPrivacyShutterClosed(), false, 'SimpliCams only report motion while the shutter is open');
+    assert.equal(await justNow.isPrivacyShutterClosed(true), true, 'a recording always checks the alarm state');
+
+    // a recording camera keeps its motion sensor on for 20s, the shutter may have closed since
+    const earlier = await requestSnapshot(make(Date.now() - 8000));
+    assert.notEqual(earlier[1].toString(), 'real-image');
 });
 
 test('battery cameras refresh their snapshot less often unless charging', () => {
@@ -777,6 +801,32 @@ test('the clip test stops retrying once SimpliSafe rate limits the plugin', asyn
     await delegate.probeEventClip(event, Date.now());
 
     assert.deepEqual(lines, ["Clip test for 'Garage Camera': stopped after 0 attempt(s), SimpliSafe is rate limiting the plugin"]);
+});
+
+test('a Doorbell Pro or SimpliCam recording asks nothing of SimpliSafe while it rate limits the plugin', async () => {
+    const https = require('node:https');
+    const get = https.get;
+    const requests = [];
+    https.get = (options, callback) => {
+        requests.push(options.host);
+        const req = new EventEmitter();
+        req.destroy = () => {};
+        setImmediate(() => callback(Object.assign(new EventEmitter(), { statusCode: 403, resume() {} })));
+        return req;
+    };
+    try {
+        const delegate = new StreamingDelegate(createCameraStub({
+            simplisafe: { isBlocked: true, nextAttempt: Date.now() + 60000 },
+        }));
+        const source = delegate.createRecordingSource({ audio: true });
+        // ends once the recording delegate listens, so an always connected camera tries again later
+        assert.equal(source.ended, false);
+        const reason = await new Promise((resolve) => source.once('end', resolve));
+        assert.equal(reason, 'request blocked (rate limited)');
+        assert.deepEqual(requests, []);
+    } finally {
+        https.get = get;
+    }
 });
 
 test('a live view re-cuts the camera\'s 100 ms Opus packets into the 20 ms packets HomeKit plays', async () => {

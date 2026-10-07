@@ -33,12 +33,19 @@ export function recordingOptions(hap) {
 
 const fragmentHistory = 16000; // ms of fragments kept, enough for the pre-roll of an always connected camera
 const ffmpegStartDelay = 300; // ms for ffmpeg to open its RTP ports before packets are sent
-const mp4Output = ['-f', 'mp4', '-movflags', 'frag_keyframe+empty_moov+default_base_moof+skip_sidx+skip_trailer', '-flush_packets', '1', 'pipe:1'];
+const audioGap = 500; // ms without the camera's audio, which comes every 100 ms, before it counts as not sent
+// ffmpeg holds video back until it has the audio of the same moment, by default for up to 10s: a pause in the
+// camera's audio would hold back HomeKit's fragments that long
+const mp4Output = ['-max_interleave_delta', '1000000', '-f', 'mp4', '-movflags', 'frag_keyframe+empty_moov+default_base_moof+skip_sidx+skip_trailer', '-flush_packets', '1', 'pipe:1'];
 
 function bindPort(port) {
     return new Promise(resolve => {
         const socket = dgram.createSocket('udp4');
-        socket.once('error', () => resolve(null));
+        socket.once('error', () => {
+            // Node keeps the socket's file descriptor open after a failed bind until it is closed
+            try { socket.close(); } catch (e) { /* already closed */ }
+            resolve(null);
+        });
         socket.bind(port, '127.0.0.1', () => resolve(socket));
     });
 }
@@ -153,6 +160,7 @@ export class LiveKitRecordingSource extends RecordingSource {
         this.pps = null;
         this.pending = []; // packets of the current access unit until a keyframe starts
         this.queue = null; // packets waiting for ffmpeg to open its ports
+        this.audioAt = 0; // when the camera's audio last came
         this.socket = null;
         this.ports = null;
         this.streams = {}; // per kind: the camera's SSRC, where its numbering starts and the numbers sent lately
@@ -198,6 +206,18 @@ export class LiveKitRecordingSource extends RecordingSource {
         this.pending.push(rtp);
 
         if (units.some(unit => unit.type === 5) && this.sps && this.pps && !this.queue) {
+            // with audio, ffmpeg writes nothing at all until audio comes, so audio is recorded only if the camera
+            // is sending it: its microphone can be off. Audio that only starts after the keyframe is left out as
+            // well, ffmpeg would line it up with the keyframe. Just after joining a running stream none may have
+            // come yet, the next keyframe tells
+            if (this.audio && !(Date.now() - this.audioAt < audioGap)) {
+                if (Date.now() - this.startedAt < audioGap) {
+                    this.lease.source.requestKeyframe();
+                    return;
+                }
+                this.audio = false;
+                if (this.debug) this.log(`Recording source for '${this.name}' has no audio: the camera is not sending any`);
+            }
             this.queue = this.pending.map(packet => ['video', packet]);
             this.pending = [];
             this.startFfmpeg().catch(err => this.end(`could not start recording: ${err.message}`));
@@ -206,6 +226,7 @@ export class LiveKitRecordingSource extends RecordingSource {
 
     handleAudio(rtp) {
         if (this.ended || !this.audio || !rtp.payload || !rtp.payload.length) return;
+        this.audioAt = Date.now();
         // audio only from the first keyframe on, so both start together
         if (this.ports) this.send('audio', rtp);
         else if (this.queue) this.queue.push(['audio', rtp]);
@@ -228,7 +249,9 @@ export class LiveKitRecordingSource extends RecordingSource {
         ].join('\r\n');
 
         const output = ['-map', '0:v:0', '-c:v', 'copy'];
-        if (this.audio) output.push('-map', '0:a:0?', '-c:a', 'aac', '-profile:a', 'aac_low', '-ar', '16000', '-ac', '1', '-b:a', '32k');
+        // a lost Opus packet (only video is retransmitted) is filled with silence, so the AAC keeps time with
+        // the video when played back to back, not only by its timestamps
+        if (this.audio) output.push('-map', '0:a:0?', '-af', 'aresample=async=1:min_hard_comp=0.02', '-c:a', 'aac', '-profile:a', 'aac_low', '-ar', '16000', '-ac', '1', '-b:a', '32k');
         else output.push('-an');
 
         // -max_delay: how long ffmpeg waits for a late (retransmitted) packet before skipping the gap
@@ -326,7 +349,8 @@ export class FlvRecordingSource extends RecordingSource {
                 res.on('error', () => this.end('the stream was interrupted'));
             });
         } catch (err) {
-            this.end(`could not open the stream: ${err.message}`);
+            // on the next tick, once the recording delegate is listening, so an always connected camera tries again
+            process.nextTick(() => this.end(`could not open the stream: ${err.message}`));
             return this;
         }
         this.request.on('timeout', () => this.end('media.simplisafe.com did not answer'));

@@ -50,6 +50,7 @@ const staleSnapshotMinAge = 5 * 60000; // ms before a camera that keeps failing 
 const legacySnapshotTimeout = 10000; // ms
 const liveKitSnapshotTimeout = 20000; // ms to join and wake a camera, battery cameras took 5-6s from sleep
 const alarmStateTimeout = 3000; // ms to wait for the alarm state when it is not known yet
+const motionShutterOpenTime = 5000; // ms after a SimpliCam's motion event that its shutter is taken to be open
 // motionTest option: how soon video could follow a motion or doorbell event
 const motionTestCooldown = 60000; // ms per camera, each test wakes a battery camera
 const motionTestTimeout = 30000; // ms to wait for the camera's video or SimpliSafe's clip
@@ -253,10 +254,18 @@ class StreamingDelegate {
                 release: lease => this.releaseLiveKitSource(lease)
             }).start();
         }
-        return new FlvRecordingSource(options, {
+        const source = new FlvRecordingSource(options, {
             uuid: this.cameraDetails.uuid,
             accessToken: () => this.ss3Camera.authManager.accessToken
-        }).start();
+        });
+        // nothing is asked of SimpliSafe while it rate limits the plugin, as for live views (LiveKit joins
+        // are refused in getCameraLiveView). Ended on the next tick, once the recording delegate is listening,
+        // so an always connected camera tries again later
+        if (this.simplisafe.isBlocked && Date.now() < this.simplisafe.nextAttempt) {
+            process.nextTick(() => source.end('request blocked (rate limited)'));
+            return source;
+        }
+        return source.start();
     }
 
     diagnostics() {
@@ -316,7 +325,9 @@ class StreamingDelegate {
     // A recording asks with ignoreMotion: motion is exactly when it starts, and the shutter may still be closed
     async isPrivacyShutterClosed(ignoreMotion = false) {
         if (!this.ss3Camera.supportsPrivacyShutter()) return false;
-        if (this.ss3Camera.motionIsTriggered && !ignoreMotion) return false;
+        // SimpliCams only report motion while the shutter is open. Counted from the event, not the motion
+        // sensor, which a recording camera holds on for longer while a disarm may have closed the shutter
+        if (!ignoreMotion && Date.now() - (this.ss3Camera.lastEventAt || 0) < motionShutterOpenTime) return false;
 
         const settings = this.cameraDetails.cameraSettings;
         const open = setting => setting === 'open';

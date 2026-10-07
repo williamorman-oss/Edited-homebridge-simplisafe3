@@ -91,6 +91,7 @@ test('a motion event starts the camera for a recording and holds the motion sens
     const details = cameraDetails();
     const cam = camera({ enabled: true }, details);
     cam.setAccessory(new hap.Accessory('Side Yard', hap.uuid.generate(details.uuid)));
+    cam.recording.updateRecordingActive(true);
     let prepared = 0;
     cam.recording.prepare = () => { prepared++; };
     const motion = cam.accessory.getService(hap.Service.MotionSensor).getCharacteristic(hap.Characteristic.MotionDetected);
@@ -133,4 +134,52 @@ test('\'Record Audio\' and turning the camera off or on in the Home app reach th
     await write(operatingModeService, hap.Characteristic.HomeKitCameraActive, 1);
     assert.equal(sources.length, 3, 'connected again once on');
     cam.recording.updateRecordingActive(false);
+});
+
+test('while HomeKit is not recording, motion is held 5s like any camera and a doorbell press is not motion', async (t) => {
+    const timers = useFakeTimers();
+    t.after(() => timers.restore());
+    const details = cameraDetails({ doorbell: true, provider: 'simplisafe' });
+    const cam = camera({ enabled: true }, details);
+    cam.setAccessory(new hap.Accessory('Side Yard', hap.uuid.generate(details.uuid)));
+    const motion = cam.accessory.getService(hap.Service.MotionSensor).getCharacteristic(hap.Characteristic.MotionDetected);
+
+    // e.g. 'Stream' chosen in the Home app while someone is home
+    cam.simplisafe.emit('DOORBELL', { sensorSerial: 'f13787bb' });
+    assert.equal(motion.value, false, 'a press is only motion while HomeKit records');
+    cam.simplisafe.emit('CAMERA_MOTION', { sensorSerial: 'f13787bb' });
+    assert.equal(motion.value, true);
+    timers.tick(5000);
+    assert.equal(motion.value, false, 'off 5s after the event');
+
+    cam.recording.updateRecordingActive(true);
+    cam.recording.prepare = () => {};
+    cam.simplisafe.emit('DOORBELL', { sensorSerial: 'f13787bb' });
+    assert.equal(motion.value, true, 'someone at the door is recorded');
+    timers.tick(20000);
+    assert.equal(motion.value, false);
+});
+
+test('a camera with a privacy shutter is never kept connected, even when listed in alwaysConnected', () => {
+    const details = {
+        uuid: 'a26f49e83ed74bbcbbca4d34f13787aa', serial: 'f13787aa', model: 'SS001',
+        supportedFeatures: { privacyShutter: true },
+        cameraSettings: { cameraName: 'Living Room', pictureQuality: '720p', shutterOff: 'closed', shutterHome: 'closed', shutterAway: 'open', admin: { fps: 20, bitRate: 300, webRTCProvider: 'simplisafe', firmwareVersion: '1.0' } },
+    };
+    const warnings = [];
+    const warnLog = Object.assign(() => {}, { error: () => {}, warn: (message) => warnings.push(message) });
+    const simplisafe = Object.assign(new EventEmitter(), { isBlocked: false, nextAttempt: 0, getCurrentAlarmState: async () => 'OFF' });
+    const cam = new SS3Camera('Living Room', details.uuid, details, {}, warnLog, false, simplisafe, { accessToken: 't' }, { hap }, { recording: { enabled: true, alwaysConnected: true } });
+    let started = 0;
+    cam.streamingDelegate.createRecordingSource = () => { started++; throw new Error('must not start'); };
+    cam.setAccessory(new hap.Accessory('Living Room', hap.uuid.generate(details.uuid)));
+
+    assert.equal(cam.recording.alwaysConnected, false);
+    assert.match(warnings.join('\n'), /privacy shutter/);
+    cam.recording.updateRecordingActive(true);
+    assert.equal(started, 0, 'not started when HomeKit turns recording on');
+
+    const outdoor = camera({ enabled: true, alwaysConnected: true });
+    outdoor.setAccessory(new hap.Accessory('Side Yard', hap.uuid.generate(cameraDetails().uuid)));
+    assert.equal(outdoor.recording.alwaysConnected, true, 'other plugged-in cameras still can be');
 });

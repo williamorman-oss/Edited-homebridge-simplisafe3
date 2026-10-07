@@ -60,12 +60,16 @@ class SS3Camera extends SimpliSafe3Accessory {
         // HomeKit Secure Video records on the camera's own motion sensor, so it has to exist first
         if (this.recordingOptions.enabled && !this.isUnsupported()) {
             if (!this.accessory.getService(this.api.hap.Service.MotionSensor)) this.accessory.addService(this.api.hap.Service.MotionSensor);
+            // a camera with a privacy shutter is only started once the shutter is known to be open, kept
+            // connected it would stream whatever the alarm state
+            const alwaysConnected = !!this.recordingOptions.alwaysConnected && !this.supportsPrivacyShutter();
+            if (this.recordingOptions.alwaysConnected && !alwaysConnected) this.log.warn(`'${this.name}' has a privacy shutter, so it is not kept connected, only started for each recording`);
             this.recording = this.streamingDelegate.enableRecording({
                 motionService: this.accessory.getService(this.api.hap.Service.MotionSensor),
-                alwaysConnected: !!this.recordingOptions.alwaysConnected
+                alwaysConnected: alwaysConnected
             });
             this.controller = this.streamingDelegate.controller;
-            if (this.recording) this.log(`'${this.name}' records in HomeKit${this.recordingOptions.alwaysConnected ? ', always connected while not on battery' : ''} once 'Stream & Allow Recording' is chosen for it in the Home app`);
+            if (this.recording) this.log(`'${this.name}' records in HomeKit${alwaysConnected ? ', always connected while not on battery' : ''} once 'Stream & Allow Recording' is chosen for it in the Home app`);
         }
 
         this.accessory.configureController(this.controller);
@@ -282,8 +286,13 @@ class SS3Camera extends SimpliSafe3Accessory {
             if (doorbell) doorbell.getCharacteristic(this.api.hap.Characteristic.ProgrammableSwitchEvent).setValue(0);
             this.runMotionTest(data, receivedAt);
             // HomeKit hubs never record on a doorbell press, someone at the door is motion too
-            if (this.recording) this.motionDetected();
+            if (this.isRecording()) this.motionDetected();
         });
+    }
+
+    // Whether HomeKit records this camera in the Home app's current mode, not only may ('Stream' does not)
+    isRecording() {
+        return !!(this.recording && this.recording.active);
     }
 
     // Turns the motion sensor on, and off again once events stop for a while. A new event keeps it on
@@ -291,12 +300,11 @@ class SS3Camera extends SimpliSafe3Accessory {
         const service = this.accessory.getService(this.api.hap.Service.MotionSensor);
         if (!service) return;
         service.updateCharacteristic(this.api.hap.Characteristic.MotionDetected, true);
-        this.motionIsTriggered = true;
         clearTimeout(this.motionTimer);
+        // held on longer only while HomeKit records, which stops when the sensor goes off
         this.motionTimer = setTimeout(() => {
             service.updateCharacteristic(this.api.hap.Characteristic.MotionDetected, false);
-            this.motionIsTriggered = false;
-        }, this.recording ? recordingMotionHold : motionHold);
+        }, this.isRecording() ? recordingMotionHold : motionHold);
     }
 
     _validateEvent(event, data) {

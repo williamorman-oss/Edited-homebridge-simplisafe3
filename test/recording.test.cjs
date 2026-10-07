@@ -42,9 +42,10 @@ function collect(source, { fragments = 3, timeout = 20000 } = {}) {
     });
 }
 
-// What an Outdoor Camera sends over LiveKit: H.264 High with a keyframe every 2s, and Opus in 100 ms packets,
-// as RTP packets in real time, emitted the way LiveKitSource does
-function fakeCamera(seconds) {
+// What an Outdoor Camera sends over LiveKit: H.264 High with a keyframe every 2s, and Opus in 100 ms packets
+// that start about a second before the video, as RTP packets in real time, emitted the way LiveKitSource does.
+// audioSeconds: how long the camera sends audio, 0 for a camera with its microphone off
+function fakeCamera(seconds, { audioSeconds = seconds + 1 } = {}) {
     const camera = new EventEmitter();
     camera.streaming = true;
     camera.requestKeyframe = () => true;
@@ -53,16 +54,19 @@ function fakeCamera(seconds) {
         socket.on('message', (message) => camera.emit(kind, RtpPacket.deSerialize(message)));
         return socket;
     });
+    const processes = [];
+    let timer = null;
+    const send = (args) => processes.push(spawn(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-re', ...args]));
     return {
         camera,
         start: () => Promise.all(sockets.map((socket) => new Promise((resolve) => socket.bind(0, '127.0.0.1', resolve)))).then(() => {
             const [video, audio] = sockets.map((socket) => socket.address().port);
-            camera.process = spawn(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-re',
-                '-f', 'lavfi', '-i', 'testsrc2=size=1280x720:rate=20', '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000', '-t', String(seconds),
-                '-map', '0:v', '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency', '-profile:v', 'high', '-g', '40', '-bf', '0', '-f', 'rtp', '-payload_type', '96', `rtp://127.0.0.1:${video}?pkt_size=1200`,
-                '-map', '1:a', '-c:a', 'libopus', '-frame_duration', '100', '-ac', '2', '-f', 'rtp', '-payload_type', '111', `rtp://127.0.0.1:${audio}`]);
+            if (audioSeconds) send(['-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000', '-t', String(audioSeconds),
+                '-c:a', 'libopus', '-frame_duration', '100', '-ac', '2', '-f', 'rtp', '-payload_type', '111', `rtp://127.0.0.1:${audio}`]);
+            timer = setTimeout(() => send(['-f', 'lavfi', '-i', 'testsrc2=size=1280x720:rate=20', '-t', String(seconds),
+                '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency', '-profile:v', 'high', '-g', '40', '-bf', '0', '-f', 'rtp', '-payload_type', '96', `rtp://127.0.0.1:${video}?pkt_size=1200`]), 1000);
         }),
-        stop: () => { if (camera.process) camera.process.kill('SIGKILL'); sockets.forEach((socket) => socket.close()); },
+        stop: () => { clearTimeout(timer); processes.forEach((process) => process.kill('SIGKILL')); sockets.forEach((socket) => socket.close()); },
     };
 }
 
@@ -161,6 +165,49 @@ test('a new stream from the camera ends the source rather than breaking the reco
     assert.equal(sent.length, 2);
 });
 
+test('with recording audio on, a camera that sends no audio is still recorded, without an audio track', { timeout: 60000 }, () => withDir(async (dir) => {
+    const fake = fakeCamera(6, { audioSeconds: 0 });
+    const source = new LiveKitRecordingSource({ name: 'Back Yard', log, debug: false, ffmpegPath: ffmpeg, audio: true }, {
+        acquire: () => ({ source: fake.camera, ready: Promise.resolve() }),
+        release: () => {},
+    });
+    source.start();
+    await fake.start();
+    try {
+        // ffmpeg told about audio that never comes writes nothing at all
+        const [fragment] = await collect(source, { fragments: 1, timeout: 8000 });
+        const file = path.join(dir, 'no-microphone.mp4');
+        fs.writeFileSync(file, Buffer.concat([source.init, fragment.data]));
+        const info = describe(file);
+        assert.match(info, /Video: h264/);
+        assert.ok(!/Audio:/.test(info));
+    } finally {
+        source.end('test over');
+        fake.stop();
+    }
+}));
+
+test('when the camera\'s audio stops, the video fragments keep coming', { timeout: 60000 }, () => withDir(async () => {
+    // audio for the first second of video only, e.g. someone starts talking through the camera from the SimpliSafe app
+    const fake = fakeCamera(10, { audioSeconds: 2 });
+    const source = new LiveKitRecordingSource({ name: 'Back Yard', log, debug: false, ffmpegPath: ffmpeg, audio: true }, {
+        acquire: () => ({ source: fake.camera, ready: Promise.resolve() }),
+        release: () => {},
+    });
+    source.start();
+    await fake.start();
+    try {
+        // a keyframe every 2s: without the pause the fragments come about 2s apart, ffmpeg's default
+        // would hold them back up to 10s
+        const fragments = await collect(source, { fragments: 3, timeout: 12000 });
+        const gaps = fragments.slice(1).map((fragment, i) => fragment.at - fragments[i].at);
+        assert.ok(gaps.every((gap) => gap < 4000), `fragments ${gaps.join(', ')} ms apart`);
+    } finally {
+        source.end('test over');
+        fake.stop();
+    }
+}));
+
 test('the Doorbell Pro\'s FLV is fetched from media.simplisafe.com with the login and copied as it is', { timeout: 60000 }, () => withDir(async (dir) => {
     // what media.simplisafe.com sends: H.264 Main full range at 20 fps with a keyframe every 2s, AAC-LC 16 kHz mono
     const flvFile = path.join(dir, 'camera.flv');
@@ -210,6 +257,46 @@ test('a refused or failed FLV request ends the source with the reason', async ()
     const source = new FlvRecordingSource({ name: 'Front Door', log, ffmpegPath: ffmpeg }, { uuid: 'x', accessToken: () => 't', transport: transport(401) });
     const reason = await new Promise((resolve) => { source.on('end', resolve); source.start(); });
     assert.equal(reason, 'media.simplisafe.com answered HTTP 401');
+});
+
+test('looking for ffmpeg\'s ports closes every socket it opened, also those that found the port taken', async () => {
+    const bindTo = (port) => new Promise((resolve) => {
+        const socket = dgram.createSocket('udp4');
+        socket.once('error', () => { socket.close(); resolve(null); });
+        socket.bind(port, '127.0.0.1', () => resolve(socket));
+    });
+    // ports held by something else: an even one for the first try's RTP, an odd one for the second try's RTCP
+    const held = [];
+    while (held.length < 2) {
+        const port = 20000 + 2 * Math.floor(Math.random() * 20000) + held.length;
+        if (held.length && port - 1 === held[0].address().port) continue;
+        const socket = await bindTo(port);
+        if (socket) held.push(socket);
+    }
+    const tries = held.map((socket, i) => ((socket.address().port - i - 20000) / 2 + 0.5) / 20000);
+    const random = Math.random;
+    const createSocket = dgram.createSocket;
+    let opened = 0;
+    let closed = 0;
+    Math.random = () => (tries.length ? tries.shift() : random());
+    dgram.createSocket = (...args) => {
+        const socket = createSocket(...args);
+        opened++;
+        socket.once('close', () => closed++);
+        return socket;
+    };
+    try {
+        const source = new LiveKitRecordingSource({ name: 'Backyard', log, ffmpegPath: ffmpeg }, { acquire() {}, release() {} });
+        source.ended = true; // stops once it has the ports, without starting ffmpeg
+        await source.startFfmpeg();
+    } finally {
+        Math.random = random;
+        dgram.createSocket = createSocket;
+        held.forEach((socket) => socket.close());
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(opened >= 6, `${opened} sockets`);
+    assert.equal(closed, opened);
 });
 
 test('the advertised recording options are the same whatever the camera, so HomeKit keeps the user\'s choice', () => {

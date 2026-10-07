@@ -50,7 +50,7 @@
           },
           "alwaysConnected": {
             "title": "Always Connected (plugged-in cameras only)",
-            "description": "Of the recording cameras, those to keep streaming all the time, so a recording starts with the seconds before the motion. SimpliSafe reports motion 4-8 seconds late, so without this a recording starts after the motion began. Uses about 2 Mbps per Outdoor Camera, all the time. Remove a camera to stop.",
+            "description": "Of the recording cameras, those to keep streaming all the time, so a recording starts with the seconds before the motion. SimpliSafe reports motion 4-8 seconds late, so without this a recording starts after the motion began. Uses about 2 Mbps per Outdoor Camera, all the time. Remove a camera to stop. Not for the SimpliCam, which is only started while its privacy shutter is open.",
             "type": "array",
             "items": { "type": "string", "title": "Camera name" }
           },
