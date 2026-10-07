@@ -112,7 +112,10 @@ export class OpusRepacker {
         this.pending = null; // { toc, frames, timestamp }
         this.lastInput = null;
         this.elapsed = 0; // input clock ticks since the first packet, so wrap-around never matters
+        this.lastDurationMs = 0;
+        this.ssrc = undefined;
         this.invalid = 0;
+        this.late = 0;
     }
 
     push(rtp) {
@@ -122,18 +125,33 @@ export class OpusRepacker {
             return [];
         }
 
-        if (this.lastInput !== null) this.elapsed += (rtp.header.timestamp - this.lastInput) | 0;
-        this.lastInput = rtp.header.timestamp;
-
         const frameMs = opusFrameDuration(parsed.toc);
+        if (this.lastInput !== null) {
+            const resync = 5 * this.clockRate; // a jump this big is a new timestamp base, not time passing
+            const delta = (rtp.header.timestamp - this.lastInput) | 0;
+            if (rtp.header.ssrc !== this.ssrc || Math.abs(delta) > resync) {
+                // a new stream, e.g. the camera published again: carry on from where the last one ended
+                this.elapsed += Math.round(this.lastDurationMs * this.clockRate / 1000);
+            } else if (delta <= 0) {
+                // a duplicate or a packet that arrived after a newer one: dropped, as if lost, so timestamps only go forward
+                this.late++;
+                return [];
+            } else {
+                this.elapsed += delta;
+            }
+        }
+        this.lastInput = rtp.header.timestamp;
+        this.ssrc = rtp.header.ssrc;
+        this.lastDurationMs = parsed.frames.length * frameMs;
+
         const startMs = this.elapsed * 1000 / this.clockRate;
         const output = [];
 
         parsed.frames.forEach((frame, i) => {
             const frameStart = startMs + i * frameMs;
             const pending = this.pending;
-            // frames only share a packet when they share a TOC and arrive in order
-            if (pending && (pending.toc !== parsed.toc || Math.abs(pending.endMs - frameStart) > frameMs / 2)) {
+            // frames only share a packet when they share a configuration and arrive in order
+            if (pending && ((pending.toc & 0xfc) !== (parsed.toc & 0xfc) || Math.abs(pending.endMs - frameStart) > frameMs / 2)) {
                 output.push(this.flush());
             }
             if (!this.pending) this.pending = { toc: parsed.toc, frames: [], startMs: frameStart, endMs: frameStart };

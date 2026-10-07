@@ -33,7 +33,9 @@ const freshSnapshotBudget = 7000; // ms to wait for a new image for a doorbell o
 // SimpliSafe's own still of a motion event, for cameras it records itself (KVS, the Outdoor Cameras). In the
 // logs it was ready within a second of the event reaching the plugin, while the camera took 2-7s to send video
 const eventImageWait = 3000; // ms to keep trying for it
-const eventImageHeadStart = 1500; // ms before the camera is asked as well
+// ms after the event before the camera is asked as well. A battery camera takes up to about 6s from sleep,
+// which with this still fits HomeKit's 7s wait for a notification image
+const eventImageHeadStart = 1000;
 const eventImageMaxAge = 15000; // ms after the event that its image is still the one to show
 const eventImageMinWidth = 640; // px, a smaller image falls back to the camera's
 const legacySnapshotRefreshAge = 10000; // ms, the Home app asks every 8-10s per visible camera
@@ -371,10 +373,13 @@ class StreamingDelegate {
     // asked once the event image has had a head start, and whichever image arrives first is used
     async fetchSnapshot(liveKit) {
         const fromCamera = () => liveKit ? this.warmSnapshot() : this.fetchLegacySnapshot();
+        const event = this.eventImage;
         const eventImage = this.fetchEventImage();
         let headStartID;
         const late = new Promise(resolve => {
-            headStartID = setTimeout(() => resolve('late'), eventImageHeadStart);
+            // counted from the event, which is when SimpliSafe makes the still, not from HomeKit's request
+            const headStart = event ? Math.max(0, event.at + eventImageHeadStart - Date.now()) : 0;
+            headStartID = setTimeout(() => resolve('late'), headStart);
         });
         const first = await Promise.race([eventImage, late]);
         clearTimeout(headStartID);
@@ -405,6 +410,8 @@ class StreamingDelegate {
     async fetchEventImage() {
         const event = this.eventImage;
         if (!event || event.tried || Date.now() - event.at > eventImageMaxAge) return null;
+        // a newer event without a still of its own, e.g. a sensor-style motion: this still is not of it
+        if ((this.ss3Camera.lastEventAt || 0) - event.at > 2000) return null;
         event.tried = true;
 
         const name = this.ss3Camera.name;
@@ -422,7 +429,8 @@ class StreamingDelegate {
                 if (this.ss3Camera.debug) this.log(`Using SimpliSafe's image of the event for '${name}' (${size.width}x${size.height}), ready ${((Date.now() - event.at) / 1000).toFixed(1)}s after the event`);
                 return body;
             }
-            if ([401, 403, 429].includes(result.status)) break;
+            // 404 means not ready yet; a refusal, a server error or no answer means it is not coming
+            if (result.status !== 404) break;
             await new Promise(resolve => setTimeout(resolve, 500));
         }
         if (this.ss3Camera.debug) this.log(`SimpliSafe's image of the event for '${name}' was not ready in ${eventImageWait / 1000}s, using the camera's`);

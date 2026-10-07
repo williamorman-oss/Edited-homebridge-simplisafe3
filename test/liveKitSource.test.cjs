@@ -261,3 +261,28 @@ test('the participants line follows who is in the room as LiveKit sends changes'
     assert.ok(!lines.join('\n').match(/camera-x|app-x|me-x|PA_/));
     source.close();
 });
+
+test('only the camera\'s own audio is passed on, not someone talking from the SimpliSafe app', () => {
+    const source = new LiveKitSource(createCamera());
+    source._handleJoin({ iceServers: [] }, () => {});
+    const receivers = [];
+    source.pc.getTransceivers = () => receivers.map((receiver) => ({ receiver }));
+    const receive = {};
+    const announce = (name, kind, streamId) => {
+        const track = { kind, codec: { mimeType: `${kind}/x` }, onReceiveRtp: { subscribe: (fn) => { receive[name] = fn; } } };
+        receivers.push({ track, remoteStreamId: streamId });
+        source.pc.onTrack.execute(track);
+    };
+    announce('cameraAudio', 'audio', 'PA_camera|TR_audio');
+    announce('cameraVideo', 'video', 'PA_camera|TR_video');
+    announce('appTalk', 'audio', 'PA_app|TR_mic');
+
+    const heard = [];
+    source.on('audio', (rtp) => heard.push(rtp.payload.toString()));
+    receive.cameraVideo({ header: { ssrc: 1, timestamp: 0 }, payload: Buffer.from([0x41]) });
+    receive.cameraAudio({ header: { ssrc: 2 }, payload: Buffer.from('camera') });
+    receive.appTalk({ header: { ssrc: 3 }, payload: Buffer.from('app') });
+
+    assert.deepEqual(heard, ['camera']);
+    source.close();
+});

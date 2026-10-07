@@ -32,6 +32,7 @@ class LiveKitSource extends EventEmitter {
         this.closed = false;
         this.streaming = false;
         this.videoTrack = null;
+        this.videoPublisher = null;
         this.videoSsrc = null;
         this.lastKeyframeRequest = 0;
         this.keyframeRequestID = null;
@@ -237,6 +238,10 @@ class LiveKitSource extends EventEmitter {
             if (this.debug) this.log(`LiveKit: subscribed to ${track.kind} (${track.codec && track.codec.mimeType})`);
 
             if (track.kind === 'video') this.videoTrack = track;
+            // LiveKit names a track's stream '<participant>|<track>'. Only the camera's own audio is wanted:
+            // someone talking from the SimpliSafe app publishes into the same room
+            const publisher = this._publisherOf(track);
+            if (track.kind === 'video') this.videoPublisher = publisher;
 
             track.onReceiveRtp.subscribe(rtp => {
                 if (this.closed) return;
@@ -253,7 +258,7 @@ class LiveKitSource extends EventEmitter {
                         notify();
                     }
                     this.emit('video', rtp);
-                } else {
+                } else if (!publisher || !this.videoPublisher || publisher === this.videoPublisher) {
                     this.emit('audio', rtp);
                 }
             });
@@ -263,6 +268,17 @@ class LiveKitSource extends EventEmitter {
             this.pingIntervalID = setInterval(() => {
                 send({ message: { case: 'ping', value: BigInt(Date.now()) } });
             }, join.pingInterval * 1000);
+        }
+    }
+
+    // The participant that published a track, from its stream id, or null if that is not known
+    _publisherOf(track) {
+        try {
+            const transceiver = this.pc.getTransceivers().find(t => t.receiver && (t.receiver.track === track || (t.receiver.tracks || []).includes(track)));
+            const streamId = transceiver && transceiver.receiver.remoteStreamId;
+            return typeof streamId === 'string' && streamId ? streamId.split('|')[0] : null;
+        } catch (e) {
+            return null;
         }
     }
 

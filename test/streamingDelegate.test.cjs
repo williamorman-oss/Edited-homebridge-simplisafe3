@@ -844,9 +844,11 @@ test('a small, late or missing event image falls back to the camera', async () =
     assert.equal((await delegate.fetchSnapshot(true)).toString(), 'camera', 'too small');
 
     let calls = 0;
+    delegate.warmSnapshot = () => new Promise((resolve) => setTimeout(() => resolve(Buffer.from('camera')), 2000)); // a camera waking up
     delegate.httpGet = async () => { calls++; return calls < 3 ? { status: 404 } : { status: 200, body: jpegOf(1280, 720) }; };
     delegate.noteEvent(kvsEvent(), Date.now());
     assert.ok((await delegate.fetchSnapshot(true)).equals(jpegOf(1280, 720)), 'ready on the third try, inside the wait');
+    delegate.warmSnapshot = async () => Buffer.from('camera');
 
     delegate.httpGet = async () => ({ status: 403 });
     delegate.noteEvent(kvsEvent(), Date.now());
@@ -896,4 +898,34 @@ test('a slow event image gets a head start, then the camera is asked too and the
     delegate.httpGet = async () => (++calls < 4 ? { status: 404 } : { status: 200, body: jpegOf(1280, 720) });
     delegate.noteEvent(kvsEvent(), Date.now());
     assert.ok((await delegate.fetchSnapshot(true)).equals(jpegOf(1280, 720)));
+});
+
+test('a server error for the event image asks the camera at once, and the head start counts from the event', async () => {
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
+    let askedAt = null;
+    delegate.warmSnapshot = async () => { askedAt = Date.now(); return Buffer.from('camera'); };
+
+    delegate.httpGet = async () => ({ status: 503 });
+    delegate.noteEvent(kvsEvent(), Date.now());
+    let started = Date.now();
+    assert.equal((await delegate.fetchSnapshot(true)).toString(), 'camera');
+    assert.ok(askedAt - started < 200, 'no head start once the still is failing');
+
+    // HomeKit asked 900 ms after the event: the camera is asked about 100 ms later, not a full head start later
+    delegate.httpGet = async () => ({ status: 404 });
+    delegate.noteEvent(kvsEvent(), Date.now() - 900);
+    started = Date.now();
+    await delegate.fetchSnapshot(true);
+    assert.ok(askedAt - started < 400, `camera asked ${askedAt - started} ms after the request`);
+});
+
+test('a later event without a still of its own does not get an earlier event\'s still', async () => {
+    const camera = createCameraStub({ getStreamProvider: () => 'livekit' });
+    const delegate = new StreamingDelegate(camera);
+    delegate.warmSnapshot = async () => Buffer.from('camera');
+    delegate.httpGet = async () => ({ status: 200, body: jpegOf(1280, 720) });
+
+    delegate.noteEvent(kvsEvent(), Date.now() - 8000);   // event A, its still never fetched
+    camera.lastEventAt = Date.now();                       // event B, a motion with no clip
+    assert.equal((await delegate.fetchSnapshot(true)).toString(), 'camera');
 });

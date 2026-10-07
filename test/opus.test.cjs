@@ -161,3 +161,18 @@ test('a lost packet or a change of Opus mode starts a new packet rather than mix
     assert.deepEqual(repacker.push({ header: { timestamp: 6720 }, payload: Buffer.from([0xfb, 9]) }), [], 'invalid packets are dropped');
     assert.equal(repacker.invalid, 1);
 });
+
+test('a duplicate or late packet is dropped, so HomeKit never gets timestamps that go back', () => {
+    const repacker = new OpusRepacker({ packetTime: 20, sampleRate: 24 });
+    const frame = Buffer.from([1, 2]);
+    const packet = (timestamp, ssrc = 7) => ({ header: { timestamp, ssrc }, payload: opusPacket(0xf8, [frame, frame]) });
+
+    const out = [];
+    for (const rtp of [packet(0), packet(0), packet(3840), packet(1920), packet(5760)]) out.push(...repacker.push(rtp));
+    assert.deepEqual(out.map((p) => p.timestamp), [0, 480, 1920, 2400, 2880, 3360], 'the duplicate and the late packet are gone');
+    assert.equal(repacker.late, 2);
+
+    // the camera publishing again starts a new timestamp base: the timeline carries on
+    const after = repacker.push(packet(123456789, 8));
+    assert.deepEqual(after.map((p) => p.timestamp), [3840, 4320]);
+});
