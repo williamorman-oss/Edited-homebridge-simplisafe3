@@ -303,6 +303,29 @@ test('a refused or failed FLV request ends the source with the reason', async ()
     assert.equal(reason, 'media.simplisafe.com answered HTTP 401');
 });
 
+test('without an ffmpeg binary a recording ends with the reason instead of throwing in a callback', async () => {
+    const transport = {
+        get(options, callback) {
+            const req = new EventEmitter();
+            req.destroy = () => {};
+            setImmediate(() => callback(Object.assign(new (require('node:stream').PassThrough)(), { statusCode: 200 })));
+            return req;
+        },
+    };
+    // ffmpeg-for-homebridge exports undefined when it has no binary for the system
+    const flv = new FlvRecordingSource({ name: 'Front Door', log, ffmpegPath: undefined }, { uuid: 'x', accessToken: () => 't', transport });
+    const reason = await new Promise((resolve) => { flv.on('end', resolve); flv.start(); });
+    assert.match(reason, /^ffmpeg could not start/);
+
+    const liveKit = new LiveKitRecordingSource({ name: 'Back Yard', log, ffmpegPath: undefined, audio: false }, { acquire: () => ({}), release: () => {} });
+    liveKit.sps = Buffer.from([0x67, 0x64, 0x00, 0x28]);
+    liveKit.pps = Buffer.from([0x68, 0xee]);
+    liveKit.queue = [];
+    const ended = new Promise((resolve) => liveKit.on('end', resolve));
+    await liveKit.startFfmpeg();
+    assert.match(await ended, /^ffmpeg could not start/);
+});
+
 test('looking for ffmpeg\'s ports closes every socket it opened, also those that found the port taken', async () => {
     const bindTo = (port) => new Promise((resolve) => {
         const socket = dgram.createSocket('udp4');

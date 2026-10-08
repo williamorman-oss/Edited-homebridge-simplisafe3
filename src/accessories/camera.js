@@ -12,6 +12,7 @@ const lowBatteryLevel = 20; // %
 const motionHold = 5000; // ms MotionDetected stays on after the last motion event
 // HomeKit records while the motion sensor is on, and SimpliSafe repeats events during long motion every 25-70s
 const recordingMotionHold = 20000; // ms
+let missingFfmpegLogged = false;
 
 class SS3Camera extends SimpliSafe3Accessory {
     constructor(name, id, cameraDetails, cameraOptions, log, debug, simplisafe, authManager, api, platformOptions = {}) {
@@ -35,6 +36,10 @@ class SS3Camera extends SimpliSafe3Accessory {
         if (this.debug && isDocker()) this.log('Detected running in docker, initializing with docker-bundled ffmpeg');
         if (this.cameraOptions && this.cameraOptions.ffmpegPath) {
             this.ffmpegPath = this.cameraOptions.ffmpegPath;
+        }
+        if (!this.ffmpegPath && !missingFfmpegLogged) {
+            missingFfmpegLogged = true;
+            this.log.error('ffmpeg is missing: ffmpeg-for-homebridge could not install it for this system. Snapshots, HomeKit recordings and the Doorbell Pro and SimpliCam live views need it. Reinstall the plugin, or install ffmpeg and set its path in ffmpeg Path (cameraOptions.ffmpegPath).');
         }
 
         const delegate = new StreamingDelegate(this);
@@ -79,9 +84,12 @@ class SS3Camera extends SimpliSafe3Accessory {
         this.accessory.getService(this.api.hap.Service.MotionSensor)
             .getCharacteristic(this.api.hap.Characteristic.MotionDetected)
             .on('get', callback => this.getState(callback, this.accessory.getService(this.api.hap.Service.MotionSensor), this.api.hap.Characteristic.MotionDetected));
+        const motionService = this.accessory.getService(this.api.hap.Service.MotionSensor);
+        // A motion sensor that was on when Homebridge stopped comes back on from the cache. The next motion would
+        // then change nothing, HomeKit would not hear of it and would start no recording
+        motionService.updateCharacteristic(this.api.hap.Characteristic.MotionDetected, false);
         // While a recording camera is Off in HomeKit its motion sensor is inactive. Once recording is taken away
         // nothing would make it active again
-        const motionService = this.accessory.getService(this.api.hap.Service.MotionSensor);
         if (!this.recording && motionService.testCharacteristic(this.api.hap.Characteristic.StatusActive)) {
             motionService.updateCharacteristic(this.api.hap.Characteristic.StatusActive, true);
         }

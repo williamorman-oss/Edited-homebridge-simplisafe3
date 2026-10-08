@@ -88,6 +88,48 @@ test('recording is switched on per camera by name, and always connected only for
     assert.deepEqual(ctx.recordingFor('Front Door'), { enabled: true, alwaysConnected: false });
 });
 
+test('a name in record or alwaysConnected that is not a SimpliSafe camera is warned about, with the names to use', async () => {
+    const { ctx, warnings } = createPlatform({ cameraOptions: { record: ['Side Yard', 'Backyard', 'Front Door'], alwaysConnected: ['Back Yard', 'Garage'] } });
+    await ctx.discoverSimpliSafeDevices();
+
+    assert.deepEqual(ctx.devices.map((device) => device.args.at(-1).recording.enabled), [true, false]);
+    assert.equal(warnings.length, 4);
+    assert.match(warnings[0], /'Backyard' in Record in HomeKit .* not the name of a SimpliSafe camera.*'Side Yard', 'Back Yard'/);
+    assert.match(warnings[1], /'Front Door' in Record in HomeKit/);
+    assert.match(warnings[2], /'Back Yard' is in Always Connected but not in Record in HomeKit/);
+    assert.match(warnings[3], /'Garage' in Always Connected .* not the name of a SimpliSafe camera/);
+});
+
+test('names match whatever their case, spacing or Unicode form, and a comma-separated list typed into config.json works', async () => {
+    const { ctx, warnings } = createPlatform({ cameraOptions: { record: 'side  yard,BACK\u00a0YARD ' } });
+    await ctx.discoverSimpliSafeDevices();
+
+    assert.deepEqual(ctx.devices.map((device) => device.args.at(-1).recording), [{ enabled: true, alwaysConnected: false }, { enabled: true, alwaysConnected: false }]);
+    assert.deepEqual(warnings, []);
+    assert.deepEqual(ctx.recordingFor('Front Door'), { enabled: false, alwaysConnected: false });
+});
+
+test('record or alwaysConnected next to cameraOptions instead of inside it is pointed out', () => {
+    const fs = require('node:fs');
+    const os = require('node:os');
+    const storage = fs.mkdtempSync(path.join(os.tmpdir(), 'ss3-platform-'));
+    const warnings = [];
+    const log = () => {};
+    log.error = () => {};
+    log.warn = (...args) => warnings.push(args.join(' '));
+    const api = { user: { storagePath: () => storage }, on: () => {}, hap: { uuid: { generate: (id) => id } } };
+    try {
+        new SS3Platform(log, { name: 'SimpliSafe Cameras', logsForClaude: false, record: ['Front Door'], cameraOptions: { alwaysConnected: ['Front Door'] } }, api);
+        assert.equal(warnings.length, 1);
+        assert.match(warnings[0], /'record' has to be inside 'cameraOptions'/);
+        warnings.length = 0;
+        new SS3Platform(log, { name: 'SimpliSafe Cameras', logsForClaude: false, cameraOptions: { record: ['Front Door'] } }, api);
+        assert.deepEqual(warnings, []);
+    } finally {
+        fs.rmSync(storage, { recursive: true, force: true });
+    }
+});
+
 test('camera details from a system refresh reach the camera', async () => {
     const { ctx } = createPlatform();
     await ctx.discoverSimpliSafeDevices();

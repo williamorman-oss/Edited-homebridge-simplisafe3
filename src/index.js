@@ -20,6 +20,15 @@ try {
 
 let UUIDGen;
 
+// How camera names in cameraOptions.record and alwaysConnected are compared with SimpliSafe's: case, spacing
+// and Unicode forms (e.g. a no-break space typed on a phone) do not matter
+const nameKey = name => String(name).normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase();
+// A list of camera names from the config: a list, or a comma-separated string written into config.json by hand
+const nameList = value => (Array.isArray(value) ? value : typeof value === 'string' ? value.split(',') : [])
+    .filter(name => typeof name === 'string' || typeof name === 'number')
+    .map(name => String(name).trim())
+    .filter(name => name);
+
 class SS3Platform {
 
     constructor(log, config, api) {
@@ -37,6 +46,13 @@ class SS3Platform {
         this.cachedAccessoryConfig = [];
         this.unreachableAccessories = [];
         this.discovered = false; // whether SimpliSafe has listed the cameras, nothing is removed before that
+
+        // easily put next to cameraOptions instead of inside it, where they would be ignored without a word
+        for (const key of ['record', 'alwaysConnected']) {
+            if (config[key] !== undefined && !(config.cameraOptions && config.cameraOptions[key] !== undefined)) {
+                this.log.warn(`'${key}' has to be inside 'cameraOptions' in the config, like "cameraOptions": { "${key}": ["Front Door"] }. As it is, no camera is ${key === 'record' ? 'recorded' : 'kept connected'}.`);
+            }
+        }
 
         if (config.camerasOnly === false) {
             this.log.warn('This plugin only adds cameras, Cameras Only is no longer a setting. The alarm, sensors and locks are for homebridge-simplisafe3.');
@@ -258,6 +274,7 @@ class SS3Platform {
                     this.devices.push(cameraAccessory);
                 }
             }
+            this.checkRecordingNames(cameras.map(camera => camera.cameraSettings.cameraName || `Camera ${camera.uuid}`));
             this.discovered = true;
         } catch (err) {
             if (err instanceof RateLimitError) {
@@ -274,9 +291,25 @@ class SS3Platform {
     // HomeKit Secure Video is switched on per camera, by name, in cameraOptions.record and alwaysConnected
     recordingFor(cameraName) {
         const options = this.cameraOptions || {};
-        const listed = list => (Array.isArray(list) ? list : []).some(name => String(name).trim().toLowerCase() === cameraName.trim().toLowerCase());
+        const listed = list => nameList(list).some(name => nameKey(name) === nameKey(cameraName));
         const enabled = listed(options.record);
         return { enabled, alwaysConnected: enabled && listed(options.alwaysConnected) };
+    }
+
+    // A name in record or alwaysConnected that is not one of SimpliSafe's camera names (a typo, or the name given
+    // in the Home app) would leave that camera without recording and nothing in the log to say why
+    checkRecordingNames(cameraNames) {
+        const options = this.cameraOptions || {};
+        const known = new Set(cameraNames.map(nameKey));
+        const names = cameraNames.map(name => `'${name}'`).join(', ');
+        const recorded = new Set(nameList(options.record).map(nameKey));
+        for (const name of nameList(options.record)) {
+            if (!known.has(nameKey(name))) this.log.warn(`'${name}' in Record in HomeKit (cameraOptions.record) is not the name of a SimpliSafe camera, so nothing is recorded for it. Use the names from the SimpliSafe app: ${names}`);
+        }
+        for (const name of nameList(options.alwaysConnected)) {
+            if (!known.has(nameKey(name))) this.log.warn(`'${name}' in Always Connected (cameraOptions.alwaysConnected) is not the name of a SimpliSafe camera. Use the names from the SimpliSafe app: ${names}`);
+            else if (!recorded.has(nameKey(name))) this.log.warn(`'${name}' is in Always Connected but not in Record in HomeKit, so it is not kept connected. Add it to Record in HomeKit as well.`);
+        }
     }
 
     updateAccessoriesReachability() {

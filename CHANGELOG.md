@@ -1,6 +1,17 @@
 # Change Log
 All notable changes are documented here.
 
+## 1.12.0-beta.9, homebridge-simplisafe3-edited (2026-10-08)
+Install, or update an earlier beta, next to the original plugin (see the README):
+```
+npm install --prefix /var/lib/homebridge https://github.com/williamorman-oss/Edited-homebridge-simplisafe3/raw/RELEASE_COMMIT/releases/homebridge-simplisafe3-edited-1.12.0-beta.9.tgz
+```
+
+- Fix: camera names could not be added to Record in HomeKit and Always Connected in the plugin's settings (no input, no Add button), so no camera recorded. Each list now has an Add Camera button. Names already in config.json are kept
+- The log warns about a name in those lists that is not a SimpliSafe camera, or one that is in Always Connected but not in Record in HomeKit, and about 'record' put next to 'cameraOptions' instead of inside it. Names match whatever their case and spacing, and a comma-separated list typed into config.json works too
+- Fix: a motion sensor that was on when Homebridge stopped came back on, so the first motion after a restart started no recording
+- If ffmpeg is missing (ffmpeg-for-homebridge could not install it), the log says so, and a Doorbell Pro or SimpliCam recording no longer takes the bridge down
+
 ## 1.12.0-beta.8, homebridge-simplisafe3-edited (2026-10-08)
 Install, or update an earlier beta, next to the original plugin (see the README):
 ```

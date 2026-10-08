@@ -55,3 +55,22 @@ test('oclif login command is present in dist', () => {
     assert.equal(typeof Login.run, 'function');
     assert.ok(fs.existsSync(path.join(distDir, distPackage.bin[distPackage.name])));
 });
+
+test('every list in the settings form has an item layout, so Homebridge UI shows its input and Add button', () => {
+    // Homebridge UI's form only draws a list's rows and Add button when the layout names its items
+    const schemaAt = (key) => key.split('.').reduce((node, part) => node && node.properties && node.properties[part], configSchema.schema);
+    const nodes = [];
+    const walk = (items) => (items || []).forEach((item) => {
+        if (typeof item === 'string') nodes.push({ key: item });
+        else if (item.key) nodes.push(item);
+        if (item && item.items) walk(item.items.filter((i) => !(i && typeof i.key === 'string' && i.key.endsWith('[]'))));
+    });
+    walk(configSchema.layout);
+
+    const lists = nodes.filter((node) => !node.key.endsWith('[]') && schemaAt(node.key) && schemaAt(node.key).type === 'array');
+    assert.deepEqual(lists.map((node) => node.key).sort(), ['cameraOptions.alwaysConnected', 'cameraOptions.record', 'excludedDevices']);
+    for (const node of lists) {
+        assert.ok(Array.isArray(node.items) && node.items.length, `${node.key} has no item layout`);
+        assert.ok(node.buttonText, `${node.key} has no Add button text`);
+    }
+});

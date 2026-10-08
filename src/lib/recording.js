@@ -93,7 +93,15 @@ export class RecordingSource extends EventEmitter {
     // Runs ffmpeg with the given input arguments, fragmenting what it writes
     spawnFfmpeg(inputArgs, outputArgs) {
         const args = ['-hide_banner', '-loglevel', 'error', ...inputArgs, ...outputArgs, ...mp4Output];
-        const cmd = spawn(this.ffmpegPath, args, { env: process.env });
+        let cmd;
+        try {
+            cmd = spawn(this.ffmpegPath, args, { env: process.env });
+        } catch (err) {
+            // e.g. no ffmpeg path at all: ffmpeg-for-homebridge could not install its binary. Thrown here, in
+            // a response callback, it would take the whole bridge down
+            this.end(`ffmpeg could not start: ${err.message}`);
+            return null;
+        }
         this.cmd = cmd;
         let stderr = '';
 
@@ -267,6 +275,7 @@ export class LiveKitRecordingSource extends RecordingSource {
 
         // -max_delay: how long ffmpeg waits for a late (retransmitted) packet before skipping the gap
         const cmd = this.spawnFfmpeg(['-protocol_whitelist', 'pipe,udp,rtp', '-max_delay', '300000', '-analyzeduration', '500000', '-probesize', '200000', '-f', 'sdp', '-i', 'pipe:0'], output);
+        if (!cmd) return;
         cmd.stdin.end(sdp);
 
         await new Promise(resolve => setTimeout(resolve, ffmpegStartDelay));
@@ -347,6 +356,10 @@ export class FlvRecordingSource extends RecordingSource {
                 if (this.audio) output.push('-map', '0:a:0?', '-c:a', 'copy');
                 else output.push('-an');
                 const cmd = this.spawnFfmpeg(['-fpsprobesize', '0', '-f', 'flv', '-i', 'pipe:0'], output);
+                if (!cmd) {
+                    res.resume();
+                    return;
+                }
                 // what keeping this camera connected all the time would cost
                 const openedAt = Date.now();
                 let bytes = 0;

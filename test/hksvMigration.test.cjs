@@ -50,6 +50,27 @@ test('switching recording on for a camera HomeKit already knows adds the recordi
     assert.ok(cam.recording, 'the camera has a recording delegate');
 });
 
+test('a motion sensor cached while on is turned off at startup, so the next motion reaches HomeKit and starts a recording', () => {
+    const details = cameraDetails();
+    const before = new hap.Accessory('Side Yard', hap.uuid.generate(details.uuid));
+    camera({ enabled: true }, details).setAccessory(before);
+    // Homebridge stopped during motion, e.g. a restart within 20 seconds of an event
+    before.getService(hap.Service.MotionSensor).updateCharacteristic(hap.Characteristic.MotionDetected, true);
+    const cached = hap.Accessory.deserialize(JSON.parse(JSON.stringify(hap.Accessory.serialize(before))));
+    assert.equal(cached.getService(hap.Service.MotionSensor).getCharacteristic(hap.Characteristic.MotionDetected).value, true);
+
+    const cam = camera({ enabled: true }, details);
+    cam.setAccessory(cached);
+    const motion = cached.getService(hap.Service.MotionSensor).getCharacteristic(hap.Characteristic.MotionDetected);
+    assert.equal(motion.value, false);
+    const changes = [];
+    motion.on('change', (change) => changes.push(change.newValue));
+    cam.recording.prepare = () => {};
+    cam.simplisafe.emit('CAMERA_MOTION', { sensorSerial: 'f13787bb' });
+    assert.deepEqual(changes, [true], 'HomeKit is told about the motion');
+    clearTimeout(cam.motionTimer);
+});
+
 test('the Doorbell Pro keeps its doorbell when recording is switched on', () => {
     const details = cameraDetails({ doorbell: true, provider: 'simplisafe' });
     const accessory = cachedAccessory(details);

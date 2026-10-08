@@ -114,8 +114,30 @@
       "expandable": true,
       "title": "Advanced Camera Settings",
       "items": [
-        "cameraOptions.record",
-        "cameraOptions.alwaysConnected",
+        {
+          "key": "cameraOptions.record",
+          "type": "array",
+          "buttonText": "Add Camera",
+          "items": [
+            {
+              "key": "cameraOptions.record[]",
+              "title": "Camera name",
+              "placeholder": "e.g. Front Door"
+            }
+          ]
+        },
+        {
+          "key": "cameraOptions.alwaysConnected",
+          "type": "array",
+          "buttonText": "Add Camera",
+          "items": [
+            {
+              "key": "cameraOptions.alwaysConnected[]",
+              "title": "Camera name",
+              "placeholder": "e.g. Back Yard"
+            }
+          ]
+        },
         "cameraOptions.batterySnapshotMinutes",
         "cameraOptions.eventImages",
         "cameraOptions.motionTest",
@@ -151,7 +173,7 @@
           "key": "excludedDevices",
           "title": "Excluded Cameras",
           "description": "Cameras to leave out of HomeKit, by the serial number shown in the SimpliSafe app.",
-          "add": "Add Another Camera",
+          "buttonText": "Add Another Camera",
           "type": "array",
           "items": [
             {
