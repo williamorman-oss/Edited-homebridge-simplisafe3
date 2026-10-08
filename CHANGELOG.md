@@ -4,7 +4,7 @@ All notable changes are documented here.
 ## 1.12.0-beta.8, homebridge-simplisafe3-edited (2026-10-08)
 Install, or update an earlier beta, next to the original plugin (see the README):
 ```
-npm install --prefix /var/lib/homebridge https://github.com/williamorman-oss/Edited-homebridge-simplisafe3/raw/RELEASE_COMMIT/releases/homebridge-simplisafe3-edited-1.12.0-beta.8.tgz
+npm install --prefix /var/lib/homebridge https://github.com/williamorman-oss/Edited-homebridge-simplisafe3/raw/78ed7cb6c9412e7761e77cbf091957c4a5201024/releases/homebridge-simplisafe3-edited-1.12.0-beta.8.tgz
 ```
 
 Cameras only:
