@@ -1,9 +1,33 @@
 # Change Log
 All notable changes are documented here.
 
-## Unreleased
-- Cameras only: the alarm, sensors and locks are no longer part of this plugin, along with the `cameras`, `camerasOnly` and `sensorRefresh` settings. They are for homebridge-simplisafe3, with its cameras turned off. Cameras already paired stay paired, with their recording settings and automations. The alarm state is still read, never changed, for the SimpliCam's privacy shutter
+## 1.12.0-beta.8, homebridge-simplisafe3-edited (2026-10-08)
+Install, or update an earlier beta, next to the original plugin (see the README):
+```
+npm install --prefix /var/lib/homebridge https://github.com/williamorman-oss/Edited-homebridge-simplisafe3/raw/RELEASE_COMMIT/releases/homebridge-simplisafe3-edited-1.12.0-beta.8.tgz
+```
+
+Cameras only:
+- The alarm, sensors and locks are no longer part of this plugin, along with the `cameras`, `camerasOnly` and `sensorRefresh` settings. They are for homebridge-simplisafe3, with its cameras turned off. Cameras already paired stay paired, with their recording settings and automations. The alarm state is still read, never changed, for the SimpliCam's privacy shutter
+- An alarm, sensor or lock this plugin added before is removed from HomeKit, so it no longer shows a stale state and homebridge-simplisafe3 can add its own
 - If a camera cannot be added because homebridge-simplisafe3 already has it on the same bridge, the log says so and how to fix it
+
+HomeKit Secure Video, after a full review (still opt-in with `record`):
+- Fix: Outdoor Camera recordings were corrupted until the next keyframe whenever a video packet arrived late or twice
+- Fix: an Outdoor Camera that sends no audio (e.g. its microphone is off) never recorded while 'Record Audio' was on; it now records without sound
+- 'Record Audio' and turning a camera off in the Home app are followed, also while connected; audio stops at once when turned off
+- A camera whose video stops without SimpliSafe ending the connection is reconnected after 10 seconds, so recordings, live views and snapshots do not wait on it
+- An always connected camera that reports it is on battery is only woken on motion until it charges again; the one-minute limit for recordings on battery follows the current charging state
+- Reconnects of an always connected camera that keeps dropping slow down to one every 5 minutes, to stay clear of SimpliSafe's rate limit
+- SimpliCam: never kept connected, not started by a motion event while its privacy shutter is closed, and a recording stops when an alarm change closes the shutter. Snapshots trust a motion event for 5 seconds only
+- A doorbell press counts as motion, and motion is held 20 seconds, only while HomeKit is recording
+- Doorbell Pro and SimpliCam recordings ask nothing of SimpliSafe while it rate limits the plugin
+- Fixes for Homebridge 1.x (a closed recording kept running), for re-pairing the bridge without a restart, and for the motion sensor after recording is removed
+
+Other fixes:
+- A rate limit or SimpliSafe error at startup no longer crashes the bridge
+- With `persistAccessories` off, cameras are no longer removed when the login fails at startup
+- Logs for Claude: the account numbers listed in the 'Multiple accounts found' error are removed
 
 ## 1.12.0-beta.7, homebridge-simplisafe3-edited (2026-10-07)
 Install, or update an earlier beta, next to the original plugin (see the README):
