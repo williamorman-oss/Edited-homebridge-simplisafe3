@@ -4,7 +4,7 @@ All notable changes are documented here.
 ## 1.12.0-beta.9, homebridge-simplisafe3-edited (2026-10-08)
 Install, or update an earlier beta, next to the original plugin (see the README):
 ```
-npm install --prefix /var/lib/homebridge https://github.com/williamorman-oss/Edited-homebridge-simplisafe3/raw/RELEASE_COMMIT/releases/homebridge-simplisafe3-edited-1.12.0-beta.9.tgz
+npm install --prefix /var/lib/homebridge https://github.com/williamorman-oss/Edited-homebridge-simplisafe3/raw/4320c8e9f9aacb3198a6056a1f1db957aba6669a/releases/homebridge-simplisafe3-edited-1.12.0-beta.9.tgz
 ```
 
 - Fix: camera names could not be added to Record in HomeKit and Always Connected in the plugin's settings (no input, no Add button), so no camera recorded. Each list now has an Add Camera button. Names already in config.json are kept
