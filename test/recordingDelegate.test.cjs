@@ -22,6 +22,8 @@ class FakeSource extends EventEmitter {
     giveInit() { this.init = Buffer.from('init'); this.emit('init', this.init); }
     giveFragment(name, at = Date.now()) { const f = { data: Buffer.from(name), at }; this.fragments.push(f); this.emit('fragment', f); }
     end(reason) { if (this.ended) return; this.ended = true; this.endReason = reason; this.emit('end', reason); }
+    // a LiveKit source drops the audio, an FLV one (copiesAudio) cannot
+    stopAudio() { if (this.copiesAudio) return false; this.audio = false; return true; }
 }
 
 function delegate(options = {}) {
@@ -328,6 +330,56 @@ test('recording off, or a closed privacy shutter, starts nothing', async () => {
     assert.equal(sources.length, 0);
 });
 
+test('a recording that is running ends, and its camera is let go, once the alarm state closes the privacy shutter', async () => {
+    let open = true;
+    let checks = 0;
+    const { recording, sources } = delegate({ allowed: async () => { checks++; return open; } });
+    recording.updateRecordingActive(true);
+    await recording.prepare();
+    const stream = recording.handleRecordingStreamRequest(1, new AbortController().signal);
+    const pending = take(stream, 4);
+    await tick();
+    sources[0].giveInit();
+    await tick();
+    sources[0].giveFragment('armed away');
+    await tick();
+
+    // an arm that keeps it open changes nothing
+    await recording.alarmStateChanged();
+    assert.equal(sources[0].ended, false);
+
+    open = false; // disarmed, the shutter closes for OFF
+    await recording.alarmStateChanged();
+    sources[0].giveFragment('after the disarm');
+    const packets = await pending;
+    assert.deepEqual(packets.map((p) => [p.data.length === 1 ? 'end' : p.data.toString(), p.isLast]), [['init', false], ['armed away', false], ['end', true]]);
+    assert.equal(sources[0].endReason, 'privacy shutter closed');
+    assert.equal(recording.source, null);
+    assert.equal(recording.streams, 0);
+
+    // with nothing connected the alarm state is not looked up
+    const before = checks;
+    await recording.alarmStateChanged();
+    assert.equal(checks, before);
+});
+
+test('a camera started after a newer shutter check is kept when an older check finds it closed', async () => {
+    let answer;
+    const { recording, sources } = delegate();
+    recording.updateRecordingActive(true);
+    await recording.prepare();
+    recording.allowed = () => new Promise((resolve) => { answer = resolve; });
+    const changed = recording.alarmStateChanged();
+    sources[0].end('dropped');
+    recording.allowed = async () => true;
+    await recording.prepare();
+    answer(false);
+    await changed;
+    assert.equal(sources.length, 2);
+    assert.equal(sources[1].ended, false);
+    recording.disconnect('test over');
+});
+
 test('a motion event whose shutter check fails, or ends after recording was turned off, starts nothing', async () => {
     const failing = delegate({ allowed: async () => { throw new Error('api down'); } });
     failing.recording.updateRecordingActive(true);
@@ -344,7 +396,7 @@ test('a motion event whose shutter check fails, or ends after recording was turn
     assert.equal(slow.sources.length, 0);
 });
 
-test('\'Record Audio\' applies from the next recording: an idle source starts again, one being recorded is kept until it ends', async () => {
+test('\'Record Audio\' turned on applies from the next recording: an idle source starts again, one being recorded is kept until it ends', async () => {
     let audio = true;
     const { recording, sources } = delegate({ alwaysConnected: true, audioActive: () => audio });
     recording.updateRecordingActive(true);
@@ -363,6 +415,51 @@ test('\'Record Audio\' applies from the next recording: an idle source starts ag
     abort.abort();
     await stream.next();
     assert.deepEqual(sources.map((s) => [s.audio, s.ended]), [[true, true], [false, true], [true, false]], 'started again once the recording ended');
+    recording.updateRecordingActive(false);
+});
+
+test('turning \'Record Audio\' off during a recording drops the audio from then on, the source is replaced once it ends', async () => {
+    let audio = true;
+    const { recording, sources } = delegate({ alwaysConnected: true, audioActive: () => audio });
+    recording.updateRecordingActive(true);
+    sources[0].giveInit();
+    const abort = new AbortController();
+    const stream = recording.handleRecordingStreamRequest(1, abort.signal);
+    await take(stream, 1);
+
+    audio = false;
+    recording.update();
+    assert.deepEqual(sources.map((s) => [s.audio, s.ended]), [[false, false]], 'the recording keeps its source, without audio');
+    const next = stream.next();
+    sources[0].giveFragment('video only');
+    assert.deepEqual([(await next).value.data.toString(), (await next).value.isLast], ['video only', false]);
+    // turned on again in the same recording: no audio until the next one
+    audio = true;
+    recording.update();
+    assert.equal(sources[0].audio, false);
+
+    abort.abort();
+    await stream.next();
+    assert.deepEqual(sources.map((s) => [s.audio, s.ended]), [[false, true], [true, false]], 'started again once the recording ended');
+    recording.updateRecordingActive(false);
+});
+
+test('turning \'Record Audio\' off during a recording from a source that copies its audio ends the recording', async () => {
+    let audio = true;
+    const { recording, sources } = delegate({ alwaysConnected: true, audioActive: () => audio,
+        createSource: ({ audio }) => { const s = new FakeSource(); s.audio = audio; s.copiesAudio = true; sources.push(s); return s; } });
+    recording.updateRecordingActive(true);
+    sources[0].giveInit();
+    const stream = recording.handleRecordingStreamRequest(1, new AbortController().signal);
+    await take(stream, 1);
+    sources[0].giveFragment('before');
+
+    audio = false;
+    recording.update();
+    assert.equal(sources[0].ended, true);
+    const rest = await take(stream, 3);
+    assert.deepEqual(rest.map((p) => [p.data.toString(), p.isLast]), [['before', true]], 'what came before is sent, then the end');
+    assert.deepEqual(sources.map((s) => [s.audio, s.ended]), [[true, true], [false, false]], 'an always connected camera starts again without audio');
     recording.updateRecordingActive(false);
 });
 

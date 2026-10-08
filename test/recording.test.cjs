@@ -208,6 +208,50 @@ test('when the camera\'s audio stops, the video fragments keep coming', { timeou
     }
 }));
 
+// AAC samples in a fragment's audio track (track 2: video is mapped first)
+function audioSamples(fragment) {
+    let count = 0;
+    const within = (start, end, visit) => {
+        for (let offset = start; offset + 8 <= end;) {
+            const size = fragment.readUInt32BE(offset);
+            visit(fragment.toString('latin1', offset + 4, offset + 8), offset + 8, offset + size);
+            offset += size;
+        }
+    };
+    within(0, fragment.length, (type, start, end) => type === 'moof' && within(start, end, (type, start, end) => {
+        if (type !== 'traf') return;
+        let track = 0;
+        within(start, end, (type, start) => {
+            if (type === 'tfhd') track = fragment.readUInt32BE(start + 4);
+            if (type === 'trun' && track === 2) count += fragment.readUInt32BE(start + 4);
+        });
+    }));
+    return count;
+}
+
+test('once \'Record Audio\' is turned off during a recording, the fragments that follow have no audio and keep coming', { timeout: 60000 }, () => withDir(async () => {
+    const fake = fakeCamera(12);
+    const source = new LiveKitRecordingSource({ name: 'Back Yard', log, debug: false, ffmpegPath: ffmpeg, audio: true }, {
+        acquire: () => ({ source: fake.camera, ready: Promise.resolve() }),
+        release: () => {},
+    });
+    source.start();
+    await fake.start();
+    try {
+        const [before] = await collect(source, { fragments: 1 });
+        assert.ok(audioSamples(before.data) > 0);
+        assert.equal(source.stopAudio(), true);
+        const after = await collect(source, { fragments: 3, timeout: 12000 });
+        // the first may still hold the audio from before, ffmpeg holds up to a second of it back
+        assert.deepEqual(after.slice(1).map((f) => audioSamples(f.data)), [0, 0]);
+        const gaps = after.map((fragment, i) => fragment.at - (i ? after[i - 1] : before).at);
+        assert.ok(gaps.every((gap) => gap < 4000), `fragments ${gaps.join(', ')} ms apart`);
+    } finally {
+        source.end('test over');
+        fake.stop();
+    }
+}));
+
 test('the Doorbell Pro\'s FLV is fetched from media.simplisafe.com with the login and copied as it is', { timeout: 60000 }, () => withDir(async (dir) => {
     // what media.simplisafe.com sends: H.264 Main full range at 20 fps with a keyframe every 2s, AAC-LC 16 kHz mono
     const flvFile = path.join(dir, 'camera.flv');

@@ -261,6 +261,17 @@ class SS3Camera extends SimpliSafe3Accessory {
     startListening() {
         this.simplisafe.on(EVENT_TYPES.CAMERA_STATUS, data => this.onCameraStatus(data));
 
+        // A SimpliCam closes its privacy shutter for some alarm states, a recording that is running stops then.
+        // SimpliSafe3 updates the alarm state from these events first, its listeners were added before
+        if (this.supportsPrivacyShutter()) {
+            const alarmChanges = [EVENT_TYPES.ALARM_DISARM, EVENT_TYPES.ALARM_CANCEL, EVENT_TYPES.ALARM_OFF, EVENT_TYPES.HOME_EXIT_DELAY, EVENT_TYPES.HOME_ARM, EVENT_TYPES.AWAY_EXIT_DELAY, EVENT_TYPES.AWAY_ARM];
+            for (const event of alarmChanges) {
+                this.simplisafe.on(event, () => {
+                    if (this.recording) this.recording.alarmStateChanged().catch(() => {});
+                });
+            }
+        }
+
         const onMotion = event => (data) => {
             if (!this._validateEvent(event, data)) return;
             const receivedAt = Date.now();

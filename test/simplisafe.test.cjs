@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const EventEmitter = require('node:events');
 
 const { loadSimplisafe } = require('./helpers/load-simplisafe.cjs');
+const { useFakeTimers } = require('./helpers/fake-timers.cjs');
 
 class FakeAuthManager extends EventEmitter {
     constructor({
@@ -258,7 +259,8 @@ test('startListening while rate limited resolves and schedules a socket retry', 
 });
 
 test('socket retry timer keeps retrying while the user ID cannot be fetched', async (t) => {
-    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const timers = useFakeTimers();
+    t.after(() => timers.restore());
     const { default: SimpliSafe3 } = loadSimplisafe({
         requestImpl: async () => {
             const err = new Error('server error');
@@ -274,7 +276,7 @@ test('socket retry timer keeps retrying while the user ID cannot be fetched', as
 
     await ss.startListening();
     assert.equal(ss.nSocketConnectFailures, 1);
-    t.mock.timers.tick(1000); // first retry runs startListening from the timer
+    timers.tick(1000); // first retry runs startListening from the timer
     await new Promise(resolve => setImmediate(resolve));
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(ss.nSocketConnectFailures, 2);

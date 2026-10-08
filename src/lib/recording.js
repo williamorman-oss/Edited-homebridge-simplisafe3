@@ -145,6 +145,11 @@ export class RecordingSource extends EventEmitter {
     }
 
     stopInput() {}
+
+    // 'Record Audio' was turned off while this source is recorded. True if no more audio reaches ffmpeg
+    stopAudio() {
+        return false;
+    }
 }
 
 // An Outdoor Camera, through the LiveKit connection it shares with live views and snapshots. RTP is
@@ -222,6 +227,12 @@ export class LiveKitRecordingSource extends RecordingSource {
             this.pending = [];
             this.startFfmpeg().catch(err => this.end(`could not start recording: ${err.message}`));
         }
+    }
+
+    // ffmpeg keeps writing the video without it, see -max_interleave_delta
+    stopAudio() {
+        this.audio = false;
+        return true;
     }
 
     handleAudio(rtp) {

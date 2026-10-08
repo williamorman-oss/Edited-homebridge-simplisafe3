@@ -47,8 +47,17 @@ class RecordingDelegate {
     // Also called when 'Record Audio' or the camera itself is turned on or off in HomeKit, which HAP does not
     // tell the delegate. HAP refuses every recording while the camera is off, so it is not kept streaming then
     update() {
-        if (!this.active || !this.cameraActive()) this.disconnect(this.active ? 'camera turned off in HomeKit' : 'recording turned off');
-        else if (this.keepConnected()) this.connect();
+        if (!this.active || !this.cameraActive()) {
+            this.disconnect(this.active ? 'camera turned off in HomeKit' : 'recording turned off');
+            return;
+        }
+        // 'Record Audio' turned off during a recording: no more audio goes to HomeKit. A source that cannot
+        // drop it (ffmpeg copies the FLV's audio) is let go, which ends the recording with what it has
+        if (this.streams && this.source && this.sourceAudio && !this.audioActive()) {
+            if (this.source.stopAudio()) this.sourceAudio = null; // replaced once the recording ends
+            else this.disconnect('Record Audio turned off');
+        }
+        if (this.keepConnected()) this.connect();
     }
 
     updateRecordingConfiguration(configuration) {
@@ -91,6 +100,21 @@ class RecordingDelegate {
         if (!allowed || !this.active || !this.cameraActive()) return;
         this.connect();
         this.scheduleIdleStop();
+    }
+
+    // The alarm state changed. A camera started while its privacy shutter was open is let go once the shutter
+    // is closed for the new state, which ends a recording using it as when the camera goes away
+    async alarmStateChanged() {
+        const source = this.source;
+        if (!source) return;
+        let allowed = false;
+        try {
+            allowed = await this.allowed();
+        } catch (e) {
+            // not known to be open, as for a new recording
+        }
+        // a source started meanwhile passed its own, newer check
+        if (!allowed && this.source === source) this.disconnect('privacy shutter closed');
     }
 
     connect() {
