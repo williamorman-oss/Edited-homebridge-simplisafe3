@@ -79,6 +79,9 @@ class RecordingDelegate {
     // the privacy shutter is closed, e.g. for an event that arrives late, after a disarm closed it
     async prepare() {
         if (!this.active || !this.cameraActive()) return;
+        // a camera that is already running is kept while the shutter is checked, which can take seconds,
+        // so its idle stop does not end it just before this event's recording needs it
+        if (this.source) this.scheduleIdleStop();
         let allowed = false;
         try {
             allowed = await this.allowed();
@@ -149,9 +152,16 @@ class RecordingDelegate {
         if (signal) signal.addEventListener('abort', close);
         const closed = closer.signal;
 
+        // as in prepare(), a running camera is not let go while the shutter is checked
+        if (this.source) this.scheduleIdleStop();
         const allowed = await this.allowed();
         // closed during the privacy check, which can take seconds: the camera is not needed
         if (closed.aborted) return;
+        // HomeKit turned recording off during the check, which HAP does not close the request for
+        if (!this.active || !this.cameraActive()) {
+            if (this.debug) this.log(`Declined HomeKit recording for '${this.name}': recording was turned off`);
+            throw new this.hap.HDSProtocolError(this.hap.HDSProtocolSpecificErrorReason.NOT_ALLOWED);
+        }
         if (!allowed) {
             if (this.debug) this.log(`Declined HomeKit recording for '${this.name}': the privacy shutter is closed`);
             throw new this.hap.HDSProtocolError(this.hap.HDSProtocolSpecificErrorReason.NOT_ALLOWED);

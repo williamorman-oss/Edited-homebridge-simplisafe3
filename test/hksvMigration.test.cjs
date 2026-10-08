@@ -160,6 +160,56 @@ test('while HomeKit is not recording, motion is held 5s like any camera and a do
     assert.equal(motion.value, false);
 });
 
+test('recording turned on again after the bridge is removed from the Home app and added back reaches the plugin', async () => {
+    const details = cameraDetails({ doorbell: true, provider: 'simplisafe' });
+    const cam = camera({ enabled: true }, details);
+    const accessory = new hap.Accessory('Side Yard', hap.uuid.generate(details.uuid));
+    cam.setAccessory(accessory);
+    const active = cam.controller.recordingManagement.recordingManagementService.getCharacteristic(hap.Characteristic.Active);
+    const hub = { remoteAddress: 'hub' };
+    const calls = [];
+    const update = cam.recording.updateRecordingActive.bind(cam.recording);
+    cam.recording.updateRecordingActive = (value) => { calls.push(value); update(value); };
+
+    await active.handleSetRequest(1, hub);
+    accessory.handleAccessoryUnpairedForControllers(); // HAP, once the last pairing is removed
+    assert.equal(cam.isRecording(), false);
+    await active.handleSetRequest(1, hub); // added back, 'Stream & Allow Recording' chosen
+    assert.equal(cam.isRecording(), true);
+    await active.handleSetRequest(0, hub);
+    assert.equal(cam.isRecording(), false);
+    assert.deepEqual(calls, [true, false, true, false], 'each change is passed on once');
+});
+
+test('restored recording settings start an always connected camera once, with the restored audio, or not at all while it is off', () => {
+    for (const cameraOn of [true, false]) {
+        const saved = {
+            configurationHash: undefined, selectedConfiguration: undefined, recordingActive: true,
+            recordingAudioActive: true, eventSnapshotsActive: true, homeKitCameraActive: cameraOn, periodicSnapshotsActive: true,
+        };
+        const details = cameraDetails();
+        const cam = camera({ enabled: true, alwaysConnected: true }, details);
+        const sources = [];
+        cam.streamingDelegate.createRecordingSource = (options) => {
+            const source = Object.assign(new EventEmitter(), { audio: options.audio, ended: false });
+            source.end = (reason) => { if (!source.ended) { source.ended = true; source.emit('end', reason); } };
+            sources.push(source);
+            return source;
+        };
+        // a new accessory is set up before Homebridge adds it to the bridge, which then restores HAP's saved state
+        const accessory = new hap.Accessory('Side Yard', hap.uuid.generate(details.uuid));
+        cam.setAccessory(accessory);
+        const management = cam.controller.recordingManagement;
+        saved.configurationHash = { algorithm: 'sha256', hash: management.computeConfigurationHash('sha256') };
+        accessory.controllerStorage.enqueueSaveRequest = () => {}; // nothing is written to disk here
+        accessory.controllerStorage.init([{ type: cam.controller.controllerId(), controllerData: { data: { streamManagements: [], recordingManagement: saved } } }]);
+
+        assert.equal(cam.isRecording(), true);
+        assert.deepEqual(sources.map((s) => [s.audio, s.ended]), cameraOn ? [[true, false]] : [], `camera ${cameraOn ? 'on' : 'off'}`);
+        cam.recording.updateRecordingActive(false);
+    }
+});
+
 test('a camera with a privacy shutter is never kept connected, even when listed in alwaysConnected', () => {
     const details = {
         uuid: 'a26f49e83ed74bbcbbca4d34f13787aa', serial: 'f13787aa', model: 'SS001',

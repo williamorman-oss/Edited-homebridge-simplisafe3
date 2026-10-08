@@ -191,3 +191,11 @@ test('account numbers that mix letters and digits are removed whole, plain words
     for (const secret of ['1234ABCD', 'ABCD', 'abcdef12', '9f8e7d6c', '7654321', '4433221']) assert.ok(!text.includes(secret), `${secret} must be removed`);
     assert.ok(text.includes('account: login'));
 });
+
+test('the account numbers listed by the "Multiple accounts found" error are removed', () => {
+    const line = 'An error occurred while discovering cameras: Error: Multiple accounts found. You must specify an account number in the plugin settings. See README https://github.com/williamorman-oss/Edited-homebridge-simplisafe3#subscriptionid-account-number for more info. The account numbers found were: 1a2b3c4d, ABCDEFAB, 9f8e7d6c.';
+    const redacted = redact(line);
+    for (const account of ['1a2b3c4d', 'ABCDEFAB', '9f8e7d6c']) assert.ok(!redacted.includes(account), redacted);
+    assert.ok(redacted.endsWith('The account numbers found were: [ID REMOVED].'), redacted);
+    assert.ok(redacted.includes('#subscriptionid-account-number for more info'), 'the README link stays');
+});

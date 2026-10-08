@@ -45,6 +45,8 @@ export function redact(text: string): string {
         .replace(/\b(uid|sid|userId|subscriptionId)\b(["']?\s*[:=]\s*["']?)\d+/gi, '$1$2[ID REMOVED]')
         // account numbers look like hex, e.g. 'abcdef12', a plain word after 'account:' stays
         .replace(/\b(account(?:\s*number)?)\b(["']?\s*[:=]\s*["']?)(?=[0-9A-Za-z]*\d)[0-9A-Za-z]+/gi, '$1$2[ID REMOVED]')
+        // the list in the 'Multiple accounts found' error, also in logs kept by older versions
+        .replace(/(account numbers found were:\s*)[0-9A-Za-z]+(?:,\s*[0-9A-Za-z]+)*/gi, '$1[ID REMOVED]')
         // the subscription number inside LiveKit room names and API paths
         .replace(/\b([0-9a-f]{32})_\d+\b/gi, '$1_[ID REMOVED]')
         .replace(/(subscriptions\/)\d+/gi, '$1[ID REMOVED]')

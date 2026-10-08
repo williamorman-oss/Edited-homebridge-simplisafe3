@@ -239,3 +239,45 @@ test('an unexpected live-view reply is described by its field names, never its c
         return true;
     });
 });
+
+test('startListening while rate limited resolves and schedules a socket retry', async () => {
+    const { default: SimpliSafe3 } = loadSimplisafe({
+        requestImpl: async () => {
+            throw new Error('should not be called');
+        },
+    });
+    const ss = new SimpliSafe3(new FakeAuthManager(), '/tmp', createLogger(), false);
+    ss.isBlocked = true;
+    ss.nextAttempt = Date.now() + 60000;
+    let retries = 0;
+    ss.handleSocketConnectionFailure = () => { retries++; };
+
+    await ss.startListening(); // used to reject with RateLimitError, which nothing caught
+    assert.equal(retries, 1);
+    assert.equal(ss.socket, undefined);
+});
+
+test('socket retry timer keeps retrying while the user ID cannot be fetched', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const { default: SimpliSafe3 } = loadSimplisafe({
+        requestImpl: async () => {
+            const err = new Error('server error');
+            err.response = { status: 500, statusText: 'Internal Server Error', data: 'Internal Server Error' };
+            throw err;
+        },
+    });
+    const ss = new SimpliSafe3(new FakeAuthManager(), '/tmp', createLogger(), false);
+    const unhandled = [];
+    const onUnhandled = err => unhandled.push(err);
+    process.on('unhandledRejection', onUnhandled);
+    t.after(() => process.off('unhandledRejection', onUnhandled));
+
+    await ss.startListening();
+    assert.equal(ss.nSocketConnectFailures, 1);
+    t.mock.timers.tick(1000); // first retry runs startListening from the timer
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(ss.nSocketConnectFailures, 2);
+    assert.equal(ss.isAwaitingSocketReconnect, true);
+    assert.deepEqual(unhandled, []);
+});

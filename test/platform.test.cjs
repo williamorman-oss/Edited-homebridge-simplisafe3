@@ -102,12 +102,16 @@ function cachedAccessory(UUID, displayName, serviceUUIDs) {
     return { UUID, displayName, services: serviceUUIDs.map((uuid) => ({ UUID: uuid })) };
 }
 
-test('a cached accessory that is not a camera is kept but not set up, and a camera is', async () => {
+test('a cached alarm, sensor or lock is removed even while accessories persist, a camera is set up or kept', async () => {
     const { ctx, warnings } = createPlatform();
     ctx.persistAccessories = true;
     ctx.simplisafe.isBlocked = false;
     ctx.authManager = { isAuthenticated: () => true };
-    ctx.api = { hap: { Service: { CameraRTPStreamManagement: { UUID: 'camera-rtp' } } }, unregisterPlatformAccessories: () => assert.fail('nothing is removed while accessories persist') };
+    const removed = [];
+    ctx.api = {
+        hap: { Service: { CameraRTPStreamManagement: { UUID: 'camera-rtp' } } },
+        unregisterPlatformAccessories: (pluginName, platformName, accessories) => removed.push(pluginName, platformName, ...accessories.map((a) => a.displayName)),
+    };
     ctx.cachedAccessoryConfig = [];
     ctx.initialLoad = ctx.discoverSimpliSafeDevices();
 
@@ -117,13 +121,64 @@ test('a cached accessory that is not a camera is kept but not set up, and a came
     ctx.devices[0].setAccessory = (accessory) => { configured = accessory; };
 
     ctx.configureAccessory(camera);
+    ctx.configureAccessory(cachedAccessory('uuid-gone-camera', 'Old Camera', ['camera-rtp']));
     ctx.configureAccessory(cachedAccessory('uuid-alarm', 'SimpliSafe 3', ['security-system']));
     await Promise.all(ctx.cachedAccessoryConfig);
 
     assert.equal(configured, camera);
     assert.deepEqual(ctx.accessories, [camera]);
+    assert.deepEqual(removed, ['homebridge-simplisafe3-edited', 'SimpliSafe 3 Edited', 'SimpliSafe 3'], 'a camera no longer in SimpliSafe persists');
     assert.equal(warnings.length, 1);
-    assert.match(warnings[0], /'SimpliSafe 3' is kept but no longer updated, this plugin only has cameras/);
+    assert.match(warnings[0], /Removing 'SimpliSafe 3' from HomeKit, this plugin only has cameras/);
+});
+
+test('a cached alarm is not removed while SimpliSafe is rate limited', async () => {
+    const { ctx } = createPlatform();
+    ctx.persistAccessories = false;
+    ctx.simplisafe.isBlocked = true;
+    ctx.api = { hap: { Service: { CameraRTPStreamManagement: { UUID: 'camera-rtp' } } }, unregisterPlatformAccessories: () => assert.fail('nothing is removed while rate limited') };
+    ctx.cachedAccessoryConfig = [];
+    ctx.unreachableAccessories = [];
+    ctx.initialLoad = Promise.resolve();
+
+    ctx.configureAccessory(cachedAccessory('uuid-alarm', 'SimpliSafe 3', ['security-system']));
+    await Promise.all(ctx.cachedAccessoryConfig);
+
+    assert.equal(ctx.unreachableAccessories.length, 1);
+});
+
+test('with persistAccessories off, cameras are only removed once SimpliSafe has listed the cameras', async () => {
+    const setup = (getCameras) => {
+        const { ctx } = createPlatform();
+        const removed = [];
+        ctx.persistAccessories = false;
+        ctx.simplisafe.isBlocked = false;
+        if (getCameras) ctx.simplisafe.getCameras = getCameras;
+        ctx.api = { hap: { Service: { CameraRTPStreamManagement: { UUID: 'camera-rtp' } } }, unregisterPlatformAccessories: (plugin, platform, accessories) => removed.push(...accessories.map((a) => a.displayName)) };
+        ctx.cachedAccessoryConfig = [];
+        // what the constructor does: a failed login or discovery is logged and initialLoad still resolves
+        ctx.initialLoad = ctx.discoverSimpliSafeDevices().catch(() => {});
+        return { ctx, removed };
+    };
+    const sideYard = () => cachedAccessory('uuid-b26f49e83ed74bbcbbca4d34f13787bb', 'Side Yard', ['camera-rtp']);
+    const frontDoor = () => cachedAccessory('uuid-gone', 'Front Door', ['camera-rtp']);
+
+    // e.g. the network is not up yet, or SimpliSafe answers 503
+    const failed = setup(async () => { throw new Error('getaddrinfo EAI_AGAIN api.simplisafe.com'); });
+    failed.ctx.configureAccessory(sideYard());
+    failed.ctx.configureAccessory(frontDoor());
+    await Promise.all(failed.ctx.cachedAccessoryConfig);
+    assert.deepEqual(failed.removed, []);
+
+    // SimpliSafe listed the cameras and Front Door is not one of them
+    const listed = setup();
+    listed.ctx.devices.length = 0;
+    await listed.ctx.initialLoad;
+    listed.ctx.devices.forEach((device) => { device.setAccessory = () => {}; });
+    listed.ctx.configureAccessory(sideYard());
+    listed.ctx.configureAccessory(frontDoor());
+    await Promise.all(listed.ctx.cachedAccessoryConfig);
+    assert.deepEqual(listed.removed, ['Front Door']);
 });
 
 test('a camera another plugin on the same bridge already has is explained', () => {
@@ -140,6 +195,29 @@ test('a camera another plugin on the same bridge already has is explained', () =
     assert.equal(errors.length, 1);
     assert.match(errors[0], /Could not add 'Side Yard': this bridge already has it, probably from homebridge-simplisafe3/);
     assert.deepEqual(ctx.accessories, []);
+});
+
+test('a camera Homebridge 2 skips because the bridge already has it is explained and not kept', () => {
+    const { ctx, errors } = createPlatform();
+    const skipped = { UUID: 'uuid-1', _associatedHAPAccessory: { bridged: false } };
+    const added = { UUID: 'uuid-2', _associatedHAPAccessory: { bridged: false } };
+    ctx.devices = [
+        { name: 'Side Yard', uuid: 'uuid-1', createAccessory: () => skipped },
+        { name: 'Back Yard', uuid: 'uuid-2', createAccessory: () => added },
+    ];
+    ctx.api = {
+        // Homebridge 2 only warns and leaves a duplicate off the bridge, it does not throw
+        registerPlatformAccessories: (plugin, platform, [accessory]) => {
+            if (accessory === added) accessory._associatedHAPAccessory.bridged = true;
+        },
+    };
+
+    ctx.createNewPlatformAccessories();
+
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Could not add 'Side Yard': this bridge already has it, probably from homebridge-simplisafe3/);
+    assert.match(errors[0], /Remove Single Cached Accessory/);
+    assert.deepEqual(ctx.accessories, [added]);
 });
 
 test('the platform only takes camera settings', () => {

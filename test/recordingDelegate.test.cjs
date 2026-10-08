@@ -116,6 +116,40 @@ test('a recording HomeKit closed during the privacy check does not start the cam
     assert.equal(recording.streams, 0);
 });
 
+test('a recording HomeKit turned off during the privacy check is declined, the camera is not started', async () => {
+    let answer;
+    const { recording, sources } = delegate({ allowed: () => new Promise((resolve) => { answer = resolve; }) });
+    recording.updateRecordingActive(true);
+    const stream = recording.handleRecordingStreamRequest(1, new AbortController().signal);
+    const first = stream.next();
+    await tick();
+    recording.updateRecordingActive(false); // 'Stream' chosen: HAP keeps the request open
+    answer(true);
+    await assert.rejects(first, (err) => err.reason === hap.HDSProtocolSpecificErrorReason.NOT_ALLOWED);
+    assert.equal(sources.length, 0);
+    assert.equal(recording.streams, 0);
+});
+
+test('a running SimpliCam is kept while a new motion event checks its shutter', async (t) => {
+    const timers = useFakeTimers();
+    t.after(() => timers.restore());
+    let slow = false;
+    let answer;
+    const { recording, sources } = delegate({ allowed: () => (slow ? new Promise((resolve) => { answer = resolve; }) : Promise.resolve(true)) });
+    recording.updateRecordingActive(true);
+    await recording.prepare();
+    timers.tick(19000);
+    // a new event near the end of the idle window, whose alarm state has to be fetched
+    slow = true;
+    const prepared = recording.prepare();
+    timers.tick(2000);
+    assert.equal(sources[0].ended, false, 'not let go while the shutter is checked');
+    answer(true);
+    await prepared;
+    assert.equal(sources.length, 1, 'the running camera is used, not opened again');
+    recording.disconnect('test over');
+});
+
 test('when the camera goes away mid-recording, HomeKit is told the recording ended', async () => {
     const { recording, sources } = delegate();
     recording.updateRecordingActive(true);

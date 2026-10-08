@@ -36,6 +36,7 @@ class SS3Platform {
 
         this.cachedAccessoryConfig = [];
         this.unreachableAccessories = [];
+        this.discovered = false; // whether SimpliSafe has listed the cameras, nothing is removed before that
 
         if (config.camerasOnly === false) {
             this.log.warn('This plugin only adds cameras, Cameras Only is no longer a setting. The alarm, sensors and locks are for homebridge-simplisafe3.');
@@ -82,7 +83,7 @@ class SS3Platform {
                 .then(() => {
                     if (!this.authManager.isAuthenticated()) throw new Error('Not authenticated with SimpliSafe.');
                     else {
-                        this.simplisafe.startListening();
+                        this.simplisafe.startListening().catch(err => this.log.error('SimpliSafe real time events could not start:', err));
                         this.createNewPlatformAccessories();
                         this.startCameraRefresh();
                     }
@@ -112,10 +113,15 @@ class SS3Platform {
                         this.accessories.push(accessory);
                     } else {
                         if (this.debug) this.log(`Cached accessory {${accessory.UUID}} not matched to a SimpliSafe camera`);
-                        if (this.persistAccessories && !accessory.services.find(s => s.UUID == this.api.hap.Service.CameraRTPStreamManagement.UUID)) {
-                            this.log.warn(`'${accessory.displayName}' is kept but no longer updated, this plugin only has cameras. Remove it from Homebridge (Settings, Remove Single Cached Accessory) if you don't need it.`);
+                        if (!accessory.services.find(s => s.UUID == this.api.hap.Service.CameraRTPStreamManagement.UUID)) {
+                            // an alarm, sensor or lock from before this plugin was camera-only can never be updated
+                            // again: kept, it would answer HomeKit with its last state, and on a shared bridge it would
+                            // stop homebridge-simplisafe3 adding its own (same UUID)
+                            this.log.warn(`Removing '${accessory.displayName}' from HomeKit, this plugin only has cameras. The alarm, sensors and locks are for homebridge-simplisafe3.`);
+                            this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+                        } else {
+                            this.removeAccessory(accessory);
                         }
-                        this.removeAccessory(accessory);
                     }
 
                     resolve();
@@ -130,7 +136,8 @@ class SS3Platform {
 
     removeAccessory(accessory) {
         if (accessory) {
-            if (!this.persistAccessories && !this.simplisafe.isBlocked) {
+            // a failed login or discovery lists no cameras, that does not mean they are gone
+            if (!this.persistAccessories && !this.simplisafe.isBlocked && this.discovered) {
                 if (this.debug) this.log('Removing accessory', accessory.name ?? accessory.UUID);
                 this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
             }
@@ -146,13 +153,19 @@ class SS3Platform {
             if (!existingAccessory) {
                 if (this.debug) this.log(`Initializing camera '${device.name}' with new accessory.`);
                 let accessory = device.createAccessory(); // from SimpliSafe3Accessory
+                // a camera is the same accessory in homebridge-simplisafe3, and one bridge can only have it once
+                const alreadyOnBridge = `Could not add '${device.name}': this bridge already has it, probably from homebridge-simplisafe3. Run this plugin as a child bridge (Bridge Settings), or turn off cameras in homebridge-simplisafe3 and remove its camera accessories (Settings, Remove Single Cached Accessory).`;
                 try {
                     this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+                    // Homebridge 2 skips an accessory whose UUID the bridge already has, with only a warning
+                    if (accessory._associatedHAPAccessory && accessory._associatedHAPAccessory.bridged === false) {
+                        this.log.error(alreadyOnBridge);
+                        continue;
+                    }
                     this.accessories.push(accessory);
                 } catch (err) {
-                    // a camera is the same accessory in homebridge-simplisafe3, and one bridge can only have it once
                     if (/same UUID/i.test(String(err && err.message))) {
-                        this.log.error(`Could not add '${device.name}': this bridge already has it, probably from homebridge-simplisafe3. Run this plugin as a child bridge (Bridge Settings), or turn off cameras in homebridge-simplisafe3.`);
+                        this.log.error(alreadyOnBridge);
                     } else {
                         this.log.error('An error occurred while adding accessory:', err.toJSON ? err.toJSON() : err);
                     }
@@ -245,6 +258,7 @@ class SS3Platform {
                     this.devices.push(cameraAccessory);
                 }
             }
+            this.discovered = true;
         } catch (err) {
             if (err instanceof RateLimitError) {
                 this.log.error('Camera discovery failed due to rate limiting or connectivity:', err.toJSON ? err.toJSON() : err);

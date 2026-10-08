@@ -404,7 +404,15 @@ class SimpliSafe3 extends EventEmitter {
             return;
         }
 
-        let userId = await this.getUserId();
+        let userId;
+        try {
+            userId = await this.getUserId();
+        } catch (err) {
+            // e.g. still rate limited at startup: try again later instead of rejecting, nothing awaits this
+            if (this.debug) this.log.error('Socket connect failed, could not get user ID:', err instanceof Error ? err.message : err);
+            this.handleSocketConnectionFailure();
+            return;
+        }
         this.socket = new WebSocket(wsUrl, {
             handshakeTimeout: 5000
         });

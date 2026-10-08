@@ -244,6 +244,11 @@ class StreamingDelegate {
         const { Characteristic } = this.api.hap;
         management.recordingManagementService.getCharacteristic(Characteristic.RecordingAudioActive).on('change', () => this.recording.update());
         management.operatingModeService.getCharacteristic(Characteristic.HomeKitCameraActive).on('change', () => this.recording.update());
+        // HAP's reset on unpairing leaves its own 'recording on' set, so after re-pairing it skips the hub's
+        // 'on'. Only a hub's write is passed on, a restore runs before the other settings are back
+        management.recordingManagementService.getCharacteristic(Characteristic.Active).on('change', change => {
+            if (change.reason === 'write' && !!change.newValue !== this.recording.active) this.recording.updateRecordingActive(!!change.newValue);
+        });
     }
 
     createRecordingSource({ audio }) {
