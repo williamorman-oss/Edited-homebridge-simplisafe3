@@ -126,4 +126,37 @@ class KeyframeCollector {
     }
 }
 
+// The NAL units an H.264 RTP payload starts or carries (RFC 6184): one NAL, a STAP-A aggregate, or the
+// first fragment of an FU-A (whose data is not complete, so it is null)
+export function rtpNalUnits(payload: Buffer | null | undefined): Array<{ type: number; data: Buffer | null }> {
+    if (!payload || !payload.length) return [];
+    const type = payload[0] & 0x1f;
+
+    if (type >= 1 && type <= 23) return [{ type, data: payload }];
+    if (type === 24) {
+        const units: Array<{ type: number; data: Buffer | null }> = [];
+        let offset = 1;
+        while (offset + 2 < payload.length) {
+            const size = payload.readUInt16BE(offset);
+            const nal = payload.subarray(offset + 2, offset + 2 + size);
+            if (nal.length) units.push({ type: nal[0] & 0x1f, data: nal });
+            offset += 2 + size;
+        }
+        return units;
+    }
+    if (type === 28 && payload.length > 1 && payload[1] & 0x80) return [{ type: payload[1] & 0x1f, data: null }];
+    return [];
+}
+
+const profiles: Record<number, string> = { 66: 'Baseline', 77: 'Main', 88: 'Extended', 100: 'High', 110: 'High 10', 122: 'High 4:2:2', 244: 'High 4:4:4' };
+
+// Profile and level from a sequence parameter set, e.g. 'Main 4.0'
+export function describeSps(sps: Buffer | null | undefined): string | null {
+    if (!sps || sps.length < 4) return null;
+    const profileIdc = sps[1];
+    const constrained = profileIdc === 66 && (sps[2] & 0x40) ? 'Constrained ' : '';
+    const level = sps[3] === 11 && (sps[2] & 0x10) ? '1b' : (sps[3] / 10).toFixed(1);
+    return `${constrained}${profiles[profileIdc] || `profile ${profileIdc}`} ${level}`;
+}
+
 export default KeyframeCollector;

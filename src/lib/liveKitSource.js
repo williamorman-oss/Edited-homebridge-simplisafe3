@@ -1,46 +1,99 @@
+import { EventEmitter } from 'events';
 import WebSocket from 'ws';
 import { RTCPeerConnection, RTCRtpCodecParameters } from 'werift';
 import {
+    ParticipantInfo_State,
     SignalRequest,
     SignalResponse,
     SessionDescription,
     TrickleRequest,
     SignalTarget
 } from '@livekit/protocol';
+import { rtpNalUnits, describeSps } from './h264';
+import { liveKitJoin, liveKitLeave, liveKitRequestResponse, participants } from './diagnosticLines';
 
-const trackTimeout = 30000; // ms, how long to wait for the camera's video track
+const trackTimeout = 30000; // ms, how long a live view waits for the camera's video
+const keyframeRequestInterval = 1000; // ms, at most one keyframe request a second
+const videoStallTimeout = 10000; // ms without video before a running session counts as dead
 
-// LiveKit subscriber. werift gives the encoded RTP so H.264 can be passed to HomeKit untouched
-class LiveKitSource {
+// LiveKit subscriber. werift gives the encoded RTP so H.264 can be passed to HomeKit untouched.
+// Emits 'video' and 'audio' with every RTP packet, so a snapshot and live views can share one connection,
+// and 'ended' when a running session dies on us, not on a deliberate close
+class LiveKitSource extends EventEmitter {
     constructor(ss3Camera) {
+        super();
         this.ss3Camera = ss3Camera;
         this.simplisafe = ss3Camera.simplisafe;
         this.log = ss3Camera.log;
         this.debug = ss3Camera.debug;
-
-        this.onVideoRtp = null;
-        this.onAudioRtp = null;
-        this.onSessionEnded = null;
 
         this.ws = null;
         this.pc = null;
         this.pingIntervalID = null;
         this.closed = false;
         this.streaming = false;
+        this.videoTrack = null;
+        this.videoPublisher = null;
+        this.videoSsrc = null;
+        this.lastKeyframeRequest = 0;
+        this.keyframeRequestID = null;
+        this.stallTimeout = videoStallTimeout;
+        this.lastVideoAt = 0;
+        this.stallTimerID = null;
+
+        // what the camera sends, logged once per connection
+        this.videoFormat = null;
+        this.videoBytes = 0;
+        this.videoStartedAt = null;
+        this.keyframeTimestamps = [];
+        this.lastKeyframeTimestamp = null;
+        this.loggedSignals = new Set();
+        this.lastParticipants = null;
+        // who else is in the room, keyed by identity, which is never logged. LiveKit sends changes only
+        this.room = new Map();
+        this.sidToIdentity = new Map();
+        this.selfIdentity = null;
     }
 
-    // Fires only when a running session dies on us, not on a deliberate close
     _sessionEnded(reason) {
         if (this.closed || !this.streaming) return;
-        const notify = this.onSessionEnded;
+        const listeners = this.listeners('ended');
         this.close();
-        if (notify) notify(reason);
+        for (const listener of listeners) listener(reason);
     }
 
-    // Resolves once the first video RTP packet arrives i.e. media is flowing
-    async connect() {
+    // Resolves once the first video RTP packet arrives i.e. media is flowing.
+    // The timeout covers the whole join, including waking a sleeping battery camera
+    async connect(timeoutMs = trackTimeout) {
+        let timeoutID;
+        const timedOut = new Promise((resolve, reject) => {
+            timeoutID = setTimeout(() => reject(new Error(this.timeoutMessage(timeoutMs))), timeoutMs);
+        });
+
+        try {
+            await Promise.race([this._connect(), timedOut]);
+        } finally {
+            clearTimeout(timeoutID);
+        }
+    }
+
+    timeoutMessage(timeoutMs) {
+        const details = this.ss3Camera.cameraDetails || {};
+        const features = details.supportedFeatures || {};
+        let hint = '';
+        if (features.battery || features.wired === false) {
+            const battery = details.cameraStatus && details.cameraStatus.batteryPercentage;
+            const level = typeof battery === 'number' ? ` (${battery}% at last check)` : '';
+            hint = ` It runs on battery${level} and may be asleep or out of charge, check its battery and Wi-Fi in the SimpliSafe app.`;
+        }
+        return `Timed out after ${timeoutMs / 1000}s waiting for video from ${this.ss3Camera.name}.${hint}`;
+    }
+
+    async _connect() {
         const liveView = await this.simplisafe.getCameraLiveView(this.ss3Camera.id);
         if (this.debug) this.log(`LiveKit: ${this.ss3Camera.name} cameraStatus ${liveView.cameraStatus}`);
+        // closed while the live view was being requested, e.g. timed out
+        if (this.closed) throw new Error('LiveKit session closed before joining');
 
         const url = `${liveView.liveKitURL}/rtc?access_token=${liveView.userToken}&auto_subscribe=1&protocol=15&sdk=js&version=2.22.3`;
         this.ws = new WebSocket(url);
@@ -51,20 +104,9 @@ class LiveKitSource {
 
         return new Promise((resolve, reject) => {
             let settled = false;
-            const timeoutID = setTimeout(() => {
-                if (!settled) {
-                    settled = true;
-                    // Battery cameras sleep and may need a wake request first, which is not implemented
-                    const features = this.ss3Camera.cameraDetails && this.ss3Camera.cameraDetails.supportedFeatures;
-                    const hint = features && features.wired === false ? ' This camera is battery powered, which is not supported yet.' : '';
-                    reject(new Error(`Timed out after ${trackTimeout}ms waiting for video from ${this.ss3Camera.name}.${hint}`));
-                }
-            }, trackTimeout);
-
             const settle = (err) => {
                 if (settled) return;
                 settled = true;
-                clearTimeout(timeoutID);
                 if (err) reject(err); else resolve();
             };
 
@@ -83,6 +125,7 @@ class LiveKitSource {
             });
 
             this.ws.on('message', async data => {
+                if (this.closed) return; // e.g. a join arriving after a timeout, would open a peer connection nobody closes
                 let response;
                 try {
                     response = SignalResponse.fromBinary(new Uint8Array(data));
@@ -91,6 +134,12 @@ class LiveKitSource {
                 }
 
                 const message = response.message;
+                const known = ['join', 'offer', 'trickle', 'update', 'requestResponse', 'leave', 'pong', 'pongResp'];
+                if (this.debug && message.case && !known.includes(message.case) && !this.loggedSignals.has(message.case)) {
+                    // only the kind of message, some carry tokens
+                    this.loggedSignals.add(message.case);
+                    this.log(`LiveKit: ${this.ss3Camera.name} sent a '${message.case}' message`);
+                }
 
                 switch (message.case) {
                 case 'join':
@@ -120,8 +169,16 @@ class LiveKitSource {
                     }
                     break;
 
+                case 'update':
+                    this._logParticipants(message.value.participants);
+                    break;
+
+                case 'requestResponse':
+                    if (this.debug) this.log(`LiveKit: ${this.ss3Camera.name} request answered, ${liveKitRequestResponse(message.value)}`);
+                    break;
+
                 case 'leave':
-                    if (this.debug) this.log('LiveKit: server ended the session');
+                    if (this.debug) this.log(`LiveKit: server ended the session for ${this.ss3Camera.name}, ${liveKitLeave(message.value)}`);
                     settle(new Error('LiveKit server ended the session'));
                     this._sessionEnded('server ended the session');
                     this.close();
@@ -134,7 +191,19 @@ class LiveKitSource {
     }
 
     _handleJoin(join, send) {
-        if (this.debug) this.log(`LiveKit: joined room ${join.room && join.room.name}`);
+        if (this.closed) return;
+        this.selfIdentity = join.participant && join.participant.identity;
+        for (const info of join.otherParticipants || []) {
+            this.room.set(info.identity, info);
+            this.sidToIdentity.set(info.sid, info.identity);
+        }
+
+        // the room name ends in the subscription number, so it is not logged
+        if (this.debug) {
+            this.log(`LiveKit: joined the room for ${this.ss3Camera.name}`);
+            this.log(`LiveKit: ${this.ss3Camera.name} room: ${liveKitJoin(join)}`);
+            this.lastParticipants = participants([...this.room.values()]);
+        }
 
         this.pc = new RTCPeerConnection({
             iceServers: (join.iceServers || []).map(server => ({
@@ -165,22 +234,40 @@ class LiveKitSource {
             send({ message: { case: 'trickle', value: new TrickleRequest({ candidateInit: JSON.stringify(candidate), target: SignalTarget.SUBSCRIBER }) } });
         });
 
+        // werift announces known tracks again on every renegotiation, listening twice would forward every packet twice
+        const knownTracks = new WeakSet();
         this.pc.onTrack.subscribe(track => {
+            if (knownTracks.has(track)) return;
+            knownTracks.add(track);
             if (this.debug) this.log(`LiveKit: subscribed to ${track.kind} (${track.codec && track.codec.mimeType})`);
+
+            if (track.kind === 'video') this.videoTrack = track;
+            // LiveKit names a track's stream '<participant>|<track>'. Only the camera's own audio is wanted:
+            // someone talking from the SimpliSafe app publishes into the same room
+            const publisher = this._publisherOf(track);
+            if (track.kind === 'video') this.videoPublisher = publisher;
 
             track.onReceiveRtp.subscribe(rtp => {
                 if (this.closed) return;
 
                 if (track.kind === 'video') {
                     this.streaming = true;
+                    this.videoSsrc = rtp.header.ssrc;
+                    if (this.videoStartedAt === null) this.videoStartedAt = Date.now();
+                    this.videoBytes += rtp.payload ? rtp.payload.length : 0;
+                    if (rtp.payload && rtp.payload.length) {
+                        this.lastVideoAt = Date.now();
+                        if (!this.stallTimerID) this._watchForStall();
+                    }
+                    this._watchVideo(rtp);
                     if (this._onFirstVideo) {
                         const notify = this._onFirstVideo;
                         this._onFirstVideo = null;
                         notify();
                     }
-                    if (this.onVideoRtp) this.onVideoRtp(rtp);
-                } else if (this.onAudioRtp) {
-                    this.onAudioRtp(rtp);
+                    this.emit('video', rtp);
+                } else if (!publisher || !this.videoPublisher || publisher === this.videoPublisher) {
+                    this.emit('audio', rtp);
                 }
             });
         });
@@ -192,16 +279,122 @@ class LiveKitSource {
         }
     }
 
+    // The participant that published a track, from its stream id, or null if that is not known
+    _publisherOf(track) {
+        try {
+            const transceiver = this.pc.getTransceivers().find(t => t.receiver && (t.receiver.track === track || (t.receiver.tracks || []).includes(track)));
+            const streamId = transceiver && transceiver.receiver.remoteStreamId;
+            return typeof streamId === 'string' && streamId ? streamId.split('|')[0] : null;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    // Who is in the room changed, e.g. the SimpliSafe app started talking through the camera
+    _logParticipants(list) {
+        for (const info of list || []) {
+            // older servers leave the identity out when someone leaves
+            const identity = info.identity || this.sidToIdentity.get(info.sid) || info.sid;
+            if (!identity || identity === this.selfIdentity) continue;
+            if (info.state === ParticipantInfo_State.DISCONNECTED) {
+                this.room.delete(identity);
+            } else {
+                this.room.set(identity, info);
+                if (info.sid) this.sidToIdentity.set(info.sid, identity);
+            }
+        }
+
+        if (!this.debug) return;
+        const summary = participants([...this.room.values()]);
+        if (summary === this.lastParticipants) return;
+        this.lastParticipants = summary;
+        this.log(`LiveKit: ${this.ss3Camera.name} participants: ${summary}`);
+    }
+
+    // LiveKit only ends a session when its signalling stops. A camera that reboots, drops off Wi-Fi or leaves
+    // the room just goes quiet, and the recording, live views and snapshots sharing this connection would wait
+    // on it for good. Ending it closes it for all of them, so the next one joins again
+    _watchForStall() {
+        const left = this.lastVideoAt + this.stallTimeout - Date.now();
+        if (left <= 0) {
+            this.stallTimerID = null;
+            this._sessionEnded(`no video for ${Math.round(this.stallTimeout / 1000)}s`);
+            return;
+        }
+        this.stallTimerID = setTimeout(() => this._watchForStall(), left);
+        if (this.stallTimerID.unref) this.stallTimerID.unref();
+    }
+
+    // Notes the camera's H.264 profile and level and how often it sends keyframes, which decide whether
+    // its video can be recorded without re-encoding. Emits 'keyframe' as each keyframe starts
+    _watchVideo(rtp) {
+        for (const nal of rtpNalUnits(rtp.payload)) {
+            if (nal.type === 7 && nal.data && !this.videoFormat) this.videoFormat = describeSps(nal.data);
+            if (nal.type !== 5 || rtp.header.timestamp === this.lastKeyframeTimestamp) continue;
+
+            this.lastKeyframeTimestamp = rtp.header.timestamp;
+            this.emit('keyframe', rtp);
+            if (this.keyframeTimestamps.length < 4) {
+                this.keyframeTimestamps.push(rtp.header.timestamp);
+                if (this.keyframeTimestamps.length === 4 && this.debug) this.log(`LiveKit: ${this.ss3Camera.name} video ${this._videoDescription()}`);
+            }
+        }
+    }
+
+    _videoDescription() {
+        const gaps = [];
+        for (let i = 1; i < this.keyframeTimestamps.length; i++) {
+            gaps.push((((this.keyframeTimestamps[i] - this.keyframeTimestamps[i - 1]) >>> 0) / 90000).toFixed(1));
+        }
+        const spacing = gaps.length ? `keyframes ${gaps.join('s, ')}s apart` : `${this.keyframeTimestamps.length} keyframe(s)`;
+        return `H.264 ${this.videoFormat || 'profile unknown'}, ${spacing}`;
+    }
+
+    // Asks the camera, through LiveKit, for a keyframe. Someone joining a running stream otherwise
+    // waits for the camera's next scheduled one before there is a picture
+    requestKeyframe() {
+        if (this.closed || !this.pc || this.videoSsrc === null) return false;
+
+        // asked less than a second ago, that keyframe may already have gone by, so ask again once allowed
+        const wait = this.lastKeyframeRequest + keyframeRequestInterval - Date.now();
+        if (wait > 0) {
+            if (!this.keyframeRequestID) {
+                this.keyframeRequestID = setTimeout(() => {
+                    this.keyframeRequestID = null;
+                    this.requestKeyframe();
+                }, wait);
+            }
+            return false;
+        }
+
+        const receivers = this.pc.getTransceivers().filter(t => t.kind === 'video').map(t => t.receiver);
+        const receiver = receivers.find(r => r.track === this.videoTrack) || receivers[0];
+        // werift silently sends nothing unless LiveKit offered picture loss feedback
+        if (!receiver || !receiver.pliEnabled) return false;
+
+        this.lastKeyframeRequest = Date.now();
+        receiver.sendRtcpPLI(this.videoSsrc).catch(() => {});
+        if (this.debug) this.log(`LiveKit: asked ${this.ss3Camera.name} for a keyframe`);
+        return true;
+    }
+
     close() {
         if (this.closed) return;
         this.closed = true;
 
+        // a connection too short to log the keyframe spacing still says what the camera sent
+        if (this.debug && this.streaming && this.keyframeTimestamps.length < 4) this.log(`LiveKit: ${this.ss3Camera.name} video ${this._videoDescription()}`);
+        // what keeping this camera connected all the time would cost
+        const seconds = this.videoStartedAt === null ? 0 : (Date.now() - this.videoStartedAt) / 1000;
+        if (this.debug && seconds >= 5) this.log(`LiveKit: ${this.ss3Camera.name} sent ${Math.round(this.videoBytes * 8 / seconds / 1000)} kbps of video over ${Math.round(seconds)}s`);
+
         clearInterval(this.pingIntervalID);
+        clearTimeout(this.keyframeRequestID);
+        this.keyframeRequestID = null;
+        clearTimeout(this.stallTimerID);
+        this.stallTimerID = null;
         this.streaming = false;
-        this.onVideoRtp = null;
-        this.onAudioRtp = null;
-        this.onSessionEnded = null;
-        this.onSessionEnded = null;
+        this.removeAllListeners();
 
         try {
             if (this.pc) this.pc.close();

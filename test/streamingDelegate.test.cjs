@@ -1,5 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { EventEmitter } = require('node:events');
 
 const StreamingDelegate = require('../dist/lib/streamingDelegate').default;
 
@@ -24,9 +25,72 @@ function createApiStub() {
     };
 }
 
+// Stands in for LiveKitSource: connect() resolves or rejects when the test says so
+class FakeLiveKitSource extends EventEmitter {
+    constructor() {
+        super();
+        this.closed = false;
+        this.streaming = false;
+        this.keyframeRequests = 0;
+        this.ready = new Promise((resolve, reject) => { this.connected = resolve; this.failed = reject; });
+    }
+
+    connect() { return this.ready; }
+
+    close() {
+        this.closed = true;
+        this.streaming = false;
+        this.removeAllListeners();
+    }
+
+    requestKeyframe() { this.keyframeRequests++; return true; }
+
+    timeoutMessage(ms) { return `Timed out after ${ms / 1000}s`; }
+
+    // a keyframe as RTP: SPS, PPS and an IDR slice sharing a timestamp
+    sendKeyframe(timestamp = 1000) {
+        [[0x67, 1], [0x68, 2], [0x65, 3]].forEach((payload, i) => {
+            this.emit('video', { payload: Buffer.from(payload), header: { timestamp, marker: i === 2, sequenceNumber: i, ssrc: 42 } });
+        });
+    }
+}
+
+function useFakeLiveKit(delegate) {
+    const created = [];
+    delegate.createLiveKitSource = () => {
+        const source = new FakeLiveKitSource();
+        created.push(source);
+        return source;
+    };
+    return created;
+}
+
+function liveKitStreamRequest(sessionID) {
+    return {
+        targetAddress: '192.168.1.5',
+        sessionID,
+        video: { port: 5010, srtp_key: Buffer.alloc(16, 1), srtp_salt: Buffer.alloc(14, 2) },
+        audio: { port: 5011, srtp_key: Buffer.alloc(16, 3), srtp_salt: Buffer.alloc(14, 4) },
+    };
+}
+
+async function startLiveView(delegate, sessionID) {
+    delegate.prepareStream(liveKitStreamRequest(sessionID), () => {});
+    let args;
+    await delegate.handleStreamRequest({
+        sessionID,
+        type: 'start',
+        video: { width: 1280, height: 720, fps: 20, max_bit_rate: 299 },
+        audio: { codec: 'OPUS', sample_rate: 24 },
+    }, (...a) => { args = a; });
+    return args;
+}
+
+const tick = () => new Promise((resolve) => setImmediate(resolve));
+
 function createCameraStub(overrides = {}) {
     return {
-        simplisafe: { isBlocked: false, nextAttempt: 0 },
+        simplisafe: { isBlocked: false, nextAttempt: 0, getCurrentAlarmState: async () => 'OFF' },
         log: (() => {
             const fn = () => {};
             fn.error = () => {};
@@ -48,7 +112,9 @@ function createCameraStub(overrides = {}) {
         isUnsupported: () => false,
         getStreamProvider: () => 'legacy',
         supportsPrivacyShutter: () => false,
-        motionIsTriggered: false,
+        isBatteryPowered: () => false,
+        isCharging: () => false,
+        lastEventAt: 0,
         ...overrides,
     };
 }
@@ -77,18 +143,232 @@ test('constructor offers square resolutions for 1:1 cameras', () => {
     assert.ok(!wide.controller.streamingOptions.video.resolutions.some(isSquare));
 });
 
-test('livekit snapshot request serves a cached frame while it is fresh', async () => {
-    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
-    const cached = Buffer.from('jpeg-bytes');
-    delegate.cachedSnapshot = cached;
-    delegate.cachedSnapshotExpires = Date.now() + 60000;
+const requestSnapshot = (delegate, request = { width: 1280, height: 720 }) => new Promise((resolve) => {
+    delegate.handleSnapshotRequest(request, (...a) => resolve(a));
+});
 
-    const args = await new Promise((resolve) => {
-        delegate.handleSnapshotRequest({ width: 1280, height: 720 }, (...a) => resolve(a));
-    });
+test('snapshot requests are answered from the cache without waiting on the camera', async () => {
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
+    let fetched = 0;
+    delegate.warmSnapshot = async () => { fetched++; return Buffer.from('new'); };
+    const cached = Buffer.from('jpeg-bytes');
+    delegate.snapshots.set(cached);
+
+    const args = await requestSnapshot(delegate);
 
     assert.equal(args[0], undefined);
     assert.equal(args[1], cached);
+    assert.equal(fetched, 0);
+});
+
+test('a stale snapshot is served at once and refreshed in the background', async () => {
+    const delegate = new StreamingDelegate(createCameraStub());
+    delegate.fetchLegacySnapshot = async () => Buffer.from('new');
+    delegate.snapshots.set(Buffer.from('old'), Date.now() - 20000);
+
+    const args = await requestSnapshot(delegate);
+    assert.equal(args[1].toString(), 'old');
+
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(delegate.snapshots.image.toString(), 'new');
+});
+
+test('a notification snapshot waits for a new image unless the cached one is only seconds old', async () => {
+    const delegate = new StreamingDelegate(createCameraStub());
+    let fetched = 0;
+    delegate.fetchLegacySnapshot = () => new Promise((resolve) => setTimeout(() => resolve(Buffer.from(`new-${++fetched}`)), 20));
+    delegate.snapshots.set(Buffer.from('cached'), Date.now() - 20000);
+
+    const args = await requestSnapshot(delegate, { width: 1280, height: 720, reason: 1 });
+    assert.equal(args[1].toString(), 'new-1');
+
+    const again = await requestSnapshot(delegate, { width: 1280, height: 720, reason: 1 });
+    assert.equal(again[1].toString(), 'new-1');
+    assert.equal(fetched, 1);
+});
+
+test('after motion only an image taken after it is served, then without asking again', async () => {
+    const motionAt = Date.now();
+    const delegate = new StreamingDelegate(createCameraStub({ lastEventAt: motionAt }));
+    let fetched = 0;
+    delegate.fetchLegacySnapshot = async () => { fetched++; return Buffer.from('new'); };
+    delegate.snapshots.set(Buffer.from('cached'), motionAt - 1000);
+
+    const first = await requestSnapshot(delegate);
+    assert.equal(first[1].toString(), 'new');
+
+    const second = await requestSnapshot(delegate);
+    assert.equal(second[1].toString(), 'new');
+    assert.equal(fetched, 1, 'the image is already newer than the motion');
+});
+
+test('a camera that keeps failing shows the unavailable placeholder instead of an old image', async () => {
+    const delegate = new StreamingDelegate(createCameraStub());
+    delegate.fetchLegacySnapshot = async () => { throw new Error('offline'); };
+    delegate.snapshots.set(Buffer.from('old'), Date.now() - 60 * 60000);
+    delegate.snapshots.failures = 2;
+
+    const args = await requestSnapshot(delegate);
+    assert.notEqual(args[1].toString(), 'old');
+    assert.ok(args[1].length > 1000);
+});
+
+test('failing battery cameras are retried less often than powered ones', () => {
+    const backoffMax = (overrides) => new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit', ...overrides })).snapshots.options.backoffMax();
+
+    assert.equal(backoffMax({}), 2 * 60000);
+    assert.equal(backoffMax({ isBatteryPowered: () => true }), 30 * 60000);
+    assert.equal(backoffMax({ isBatteryPowered: () => true, isCharging: () => true }), 2 * 60000);
+});
+
+test('snapshots of cameras with a privacy shutter are never written to disk', () => {
+    const indoor = new StreamingDelegate(createCameraStub({ supportsPrivacyShutter: () => true, snapshotPath: '/tmp/indoor.jpg' }));
+    const outdoor = new StreamingDelegate(createCameraStub({ snapshotPath: '/tmp/outdoor.jpg' }));
+
+    assert.equal(indoor.snapshots.options.persistPath, undefined);
+    assert.equal(outdoor.snapshots.options.persistPath, '/tmp/outdoor.jpg');
+});
+
+test('a camera that cannot be reached gets a placeholder rather than holding up HomeKit', async () => {
+    const delegate = new StreamingDelegate(createCameraStub());
+    delegate.fetchLegacySnapshot = async () => { throw new Error('offline'); };
+
+    const args = await requestSnapshot(delegate);
+
+    assert.equal(args[0], undefined);
+    assert.ok(Buffer.isBuffer(args[1]) && args[1].length > 0);
+    assert.equal(delegate.snapshots.failing, true);
+});
+
+test('nothing is fetched while rate limited, a cached image is still served', async () => {
+    const delegate = new StreamingDelegate(createCameraStub({
+        simplisafe: { isBlocked: true, nextAttempt: Date.now() + 60000 },
+    }));
+    let fetched = 0;
+    delegate.fetchLegacySnapshot = async () => { fetched++; return Buffer.from('new'); };
+    delegate.snapshots.set(Buffer.from('old'), Date.now() - 60000);
+
+    const args = await requestSnapshot(delegate);
+
+    assert.equal(args[1].toString(), 'old');
+    assert.equal(fetched, 0);
+});
+
+test('privacy shutter state follows the alarm state without blocking on errors', async () => {
+    const shutterSettings = { shutterOff: 'closedAlarmOnly', shutterHome: 'open', shutterAway: 'open' };
+    const make = (getCurrentAlarmState) => {
+        const delegate = new StreamingDelegate(createCameraStub({
+            supportsPrivacyShutter: () => true,
+            simplisafe: { isBlocked: false, nextAttempt: 0, getCurrentAlarmState },
+            cameraDetails: {
+                uuid: 'camera-uuid',
+                cameraSettings: { admin: { fps: 20, bitRate: 300 }, pictureQuality: '720p', cameraName: 'Indoor', ...shutterSettings },
+            },
+        }));
+        delegate.snapshots.set(Buffer.from('real-image'));
+        return delegate;
+    };
+
+    const closed = await requestSnapshot(make(async () => 'OFF'));
+    assert.notEqual(closed[1].toString(), 'real-image');
+
+    const open = await requestSnapshot(make(async () => 'HOME'));
+    assert.equal(open[1].toString(), 'real-image');
+
+    const unknown = await requestSnapshot(make(async () => null));
+    assert.notEqual(unknown[1].toString(), 'real-image', 'an unknown alarm state must not show the camera');
+
+    // exit delay from OFF (closed) to AWAY (open): closed until armed
+    const exitDelay = await requestSnapshot(make(async () => 'AWAY_COUNT'));
+    assert.notEqual(exitDelay[1].toString(), 'real-image');
+
+    const unexpected = await requestSnapshot(make(async () => 'SOMETHING_NEW'));
+    assert.notEqual(unexpected[1].toString(), 'real-image');
+
+    const failed = await requestSnapshot(make(async () => { throw new Error('api down'); }));
+    assert.ok(failed[0] instanceof Error, 'errors must reach HomeKit instead of leaving it waiting');
+});
+
+test('a motion event shows the camera for 5s whatever the alarm state, however long the motion sensor stays on', async () => {
+    const make = (lastEventAt) => {
+        const delegate = new StreamingDelegate(createCameraStub({
+            supportsPrivacyShutter: () => true,
+            lastEventAt,
+            // OFF closes the shutter, e.g. disarmed after walking in during AWAY
+            simplisafe: { isBlocked: false, nextAttempt: 0, getCurrentAlarmState: async () => 'OFF' },
+            cameraDetails: {
+                uuid: 'camera-uuid',
+                cameraSettings: { admin: { fps: 20, bitRate: 300 }, pictureQuality: '720p', cameraName: 'Indoor', shutterOff: 'closed', shutterHome: 'closed', shutterAway: 'open' },
+            },
+        }));
+        delegate.snapshots.set(Buffer.from('real-image'));
+        return delegate;
+    };
+
+    const justNow = make(Date.now() - 2000);
+    assert.equal(await justNow.isPrivacyShutterClosed(), false, 'SimpliCams only report motion while the shutter is open');
+    assert.equal(await justNow.isPrivacyShutterClosed(true), true, 'a recording always checks the alarm state');
+
+    // a recording camera keeps its motion sensor on for 20s, the shutter may have closed since
+    const earlier = await requestSnapshot(make(Date.now() - 8000));
+    assert.notEqual(earlier[1].toString(), 'real-image');
+});
+
+test('battery cameras refresh their snapshot less often unless charging', () => {
+    const age = (overrides) => new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit', ...overrides })).snapshotRefreshAge();
+
+    assert.equal(new StreamingDelegate(createCameraStub()).snapshotRefreshAge(), 10000);
+    assert.equal(age({}), 60000);
+    assert.equal(age({ isBatteryPowered: () => true }), 10 * 60000);
+    assert.equal(age({ isBatteryPowered: () => true, isCharging: () => true }), 60000);
+    assert.equal(age({ isBatteryPowered: () => true, cameraOptions: { batterySnapshotMinutes: 3 } }), 3 * 60000);
+});
+
+test('legacy live view starts without -re and with low-latency input options', () => {
+    const delegate = new StreamingDelegate(createCameraStub());
+    delegate.serverIpAddress = '1.2.3.4';
+    const sessionInfo = {
+        address: '192.168.1.5',
+        video_port: 5010,
+        audio_port: 5011,
+        video_ssrc: 1,
+        audio_ssrc: 2,
+        video_srtp: Buffer.alloc(30),
+        audio_srtp: Buffer.alloc(30),
+    };
+    const request = { video: { width: 1280, fps: 20, max_bit_rate: 299, mtu: 1378 }, audio: { codec: 'AAC-eld', max_bit_rate: 24, sample_rate: 16 } };
+
+    const { source, video, audio } = delegate.buildLegacyStreamArgs(request, sessionInfo);
+
+    assert.ok(!source.includes('-re'));
+    const input = source.indexOf('-i');
+    for (const flag of ['-fpsprobesize', '-flags']) {
+        assert.ok(source.indexOf(flag) > -1 && source.indexOf(flag) < input, `${flag} must be an input option`);
+    }
+    assert.ok(!source.includes('-analyzeduration'), 'a short analyzeduration loses an audio track that starts late');
+    assert.equal(video[video.indexOf('-map') + 1], '0:v:0');
+    assert.equal(audio[audio.indexOf('-map') + 1], '0:a:0');
+    assert.equal(video[video.indexOf('-g') + 1], '40');
+    assert.ok(video.at(-1).startsWith('srtp://') && audio.at(-1).startsWith('srtp://'));
+});
+
+test('legacy live view applies user options in the right place', () => {
+    const delegate = new StreamingDelegate(createCameraStub({
+        cameraOptions: { sourceOptions: '-re -analyzeduration 500000', videoOptions: '-tune false -crf 23', audioOptions: '-ac 2' },
+    }));
+    delegate.serverIpAddress = '1.2.3.4';
+    const sessionInfo = { address: 'a', video_port: 1, audio_port: 2, video_ssrc: 1, audio_ssrc: 2, video_srtp: Buffer.alloc(30), audio_srtp: Buffer.alloc(30) };
+    const request = { video: { width: 1280, fps: 20, max_bit_rate: 299 }, audio: { codec: 'OPUS' } };
+
+    const { source, video, audio } = delegate.buildLegacyStreamArgs(request, sessionInfo);
+
+    assert.ok(source.indexOf('-re') > -1 && source.indexOf('-re') < source.indexOf('-i'));
+    assert.equal(source[source.indexOf('-analyzeduration') + 1], '500000');
+    assert.ok(!video.includes('-tune'));
+    assert.ok(video.indexOf('-crf') > -1 && video.indexOf('-crf') < video.length - 1);
+    assert.equal(audio[audio.indexOf('-ac') + 1], '2');
+    assert.equal(audio[audio.indexOf('-acodec') + 1], 'libopus');
+    assert.ok(!source.at(-1).includes('audioEncoding=AAC'));
 });
 
 test('stopLiveKitStream is a no-op for an unknown session', () => {
@@ -163,31 +443,42 @@ test('handleStreamRequest acknowledges a reconfigure request', async () => {
     assert.equal(args[0], undefined);
 });
 
-test('livekit snapshot prefers a stale cache over joining the room twice', async () => {
+test('livekit snapshots are not refreshed by joining again while a live view is running', async () => {
     const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
+    let joined = 0;
+    delegate.warmSnapshot = async () => { joined++; return Buffer.from('new'); };
     const stale = Buffer.from('stale-jpeg');
-    delegate.cachedSnapshot = stale;
-    delegate.cachedSnapshotExpires = Date.now() - 1000;   // expired
+    delegate.snapshots.set(stale, Date.now() - 120000);   // expired
     delegate.liveKitSessions['uuid:active'] = {};          // a stream is running
 
-    const args = await new Promise((resolve) => {
-        delegate.handleSnapshotRequest({ width: 1280, height: 720 }, (...a) => resolve(a));
-    });
+    const args = await requestSnapshot(delegate);
 
     assert.equal(args[0], undefined);
     assert.equal(args[1], stale);
-    assert.equal(delegate.snapshotWarming, null);          // no second room was opened
+    assert.equal(joined, 0);                               // no second room was opened
+});
+
+test('a running live view keeps the snapshot current', async () => {
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
+    delegate.jpegFromKeyframe = async () => Buffer.from('from-stream');
+    delegate.snapshots.set(Buffer.from('old'), Date.now() - 30000);
+    let reset = false;
+
+    delegate.cacheSnapshotFromStream({ annexB: () => Buffer.from('keyframe'), reset: () => { reset = true; } });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(reset, true);
+    assert.equal(delegate.snapshots.image.toString(), 'from-stream');
 });
 
 test('startLiveKitStream reports setup failures instead of leaving HAP hanging', () => {
     const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
-    let closed = false;
+    const created = useFakeLiveKit(delegate);
     const sessionInfo = {
         address: '192.168.1.5',
         video_port: 5010,
         video_srtp: undefined,                             // makes createSrtpSession throw
-        liveKitSource: { close: () => { closed = true; } },
-        liveKitReady: Promise.resolve(),
+        liveKit: delegate.acquireLiveKitSource(),
     };
 
     let callbackArgs;
@@ -195,5 +486,496 @@ test('startLiveKitStream reports setup failures instead of leaving HAP hanging',
 
     assert.ok(callbackArgs, 'callback must always be called');
     assert.ok(callbackArgs[0] instanceof Error);
-    assert.equal(closed, true, 'the pre-warmed source must be closed');
+    assert.equal(created[0].closed, true, 'the pre-warmed source must be closed');
+    assert.equal(delegate.liveKitShared, null);
+});
+
+test('a failed ffmpeg start answers HomeKit exactly once', async () => {
+    const delegate = new StreamingDelegate(createCameraStub({ ffmpegPath: '/nonexistent/ffmpeg' }));
+    delegate.resolveMediaServer = async () => '1.2.3.4';
+    delegate.pendingSessions['uuid:session-1'] = {
+        address: '192.168.1.5', video_port: 5010, audio_port: 5011, video_ssrc: 1, audio_ssrc: 2,
+        video_srtp: Buffer.alloc(30), audio_srtp: Buffer.alloc(30),
+    };
+
+    const calls = [];
+    await delegate.handleStreamRequest({
+        sessionID: 'session-1',
+        type: 'start',
+        video: { width: 1280, fps: 20, max_bit_rate: 299, mtu: 1378 },
+        audio: { codec: 'AAC-eld', max_bit_rate: 24, sample_rate: 16 },
+    }, (...args) => calls.push(args));
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    assert.equal(calls.length, 1);
+    assert.ok(calls[0][0] instanceof Error);
+});
+
+test('stream requests are logged in one line, without the stream keys', async () => {
+    const lines = [];
+    const log = (...args) => lines.push(args.map(String).join(' '));
+    log.error = log;
+    const delegate = new StreamingDelegate(createCameraStub({ debug: true, log, getStreamProvider: () => 'legacy' }));
+
+    delegate.prepareStream({
+        targetAddress: '192.168.1.5',
+        sessionID: 'session-1',
+        video: { port: 5010, srtp_key: Buffer.from('1234567890123456'), srtp_salt: Buffer.from('12345678901234') },
+        audio: { port: 5011, srtp_key: Buffer.from('abcdefghijklmnop'), srtp_salt: Buffer.from('abcdefghijklmn') },
+    }, () => {});
+    await delegate.handleStreamRequest({ sessionID: 'session-2', type: 'stop' }, () => {});
+
+    assert.ok(lines.some((line) => line === "Prepare stream for 'Garage Camera' to 192.168.1.5"));
+    assert.ok(lines.some((line) => line === "Stream stop for 'Garage Camera'"));
+    assert.ok(!lines.join('\n').includes('srtp'));
+    assert.ok(!lines.join('\n').includes('1234567890'));
+});
+
+test('a live view opened while a snapshot is being taken shares its connection', async () => {
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
+    const created = useFakeLiveKit(delegate);
+    delegate.jpegFromKeyframe = async () => Buffer.from('jpeg');
+    const forwarded = [];
+    delegate.forwardRtp = (rtp, srtp, socket, payloadType, ssrc) => forwarded.push(ssrc);
+
+    const snapshot = delegate.warmSnapshot();             // wakes the camera
+    const started = await startLiveView(delegate, 'live-1');
+
+    assert.equal(started[0], undefined);
+    assert.equal(created.length, 1, 'the live view joins the snapshot\'s connection');
+    const source = created[0];
+
+    source.streaming = true;
+    source.connected();
+    await tick();
+    source.sendKeyframe();
+
+    assert.equal((await snapshot).toString(), 'jpeg');
+    assert.equal(forwarded.length, 3, 'the same packets reach the live view');
+    assert.equal(source.closed, false, 'the live view still uses the connection');
+
+    await delegate.handleStreamRequest({ sessionID: 'live-1', type: 'stop' }, () => {});
+    assert.equal(source.closed, true, 'closed as soon as nobody uses it');
+    assert.equal(delegate.liveKitShared, null);
+});
+
+test('a second viewer joins a running stream and asks for a keyframe', async () => {
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
+    const created = useFakeLiveKit(delegate);
+    delegate.forwardRtp = () => {};
+
+    await startLiveView(delegate, 'phone');
+    const source = created[0];
+    source.streaming = true;
+    source.connected();
+    await tick();
+    assert.equal(source.keyframeRequests, 0, 'a new connection starts with a keyframe anyway');
+
+    await startLiveView(delegate, 'tablet');
+    assert.equal(created.length, 1);
+    assert.equal(source.keyframeRequests, 1);
+
+    await delegate.handleStreamRequest({ sessionID: 'phone', type: 'stop' }, () => {});
+    assert.equal(source.closed, false);
+    assert.equal(source.listenerCount('video'), 1, 'only the stopped viewer stops receiving');
+
+    await delegate.handleStreamRequest({ sessionID: 'tablet', type: 'stop' }, () => {});
+    assert.equal(source.closed, true);
+});
+
+test('a dropped connection stops every live view on it and the next one reconnects', async () => {
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
+    const created = useFakeLiveKit(delegate);
+    delegate.forwardRtp = () => {};
+    const forceStopped = [];
+    delegate.controller.forceStopStreamingSession = (id) => forceStopped.push(id);
+
+    await startLiveView(delegate, 'phone');
+    await startLiveView(delegate, 'tablet');
+    const source = created[0];
+    source.streaming = true;
+    source.connected();
+    await tick();
+
+    // what LiveKitSource does when the room goes away under a running stream
+    const listeners = source.listeners('ended');
+    source.close();
+    listeners.forEach((listener) => listener('signalling closed'));
+
+    assert.deepEqual(forceStopped.sort(), ['phone', 'tablet']);
+    assert.deepEqual(Object.keys(delegate.liveKitSessions), []);
+    assert.equal(delegate.liveKitShared, null);
+
+    delegate.acquireLiveKitSource();
+    assert.equal(created.length, 2, 'a closed connection is never reused');
+});
+
+test('a failed join is not reused and HomeKit is told the stream stopped', async () => {
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
+    const created = useFakeLiveKit(delegate);
+    const forceStopped = [];
+    delegate.controller.forceStopStreamingSession = (id) => forceStopped.push(id);
+
+    await startLiveView(delegate, 'phone');
+    created[0].failed(new Error('Timed out after 30s waiting for video'));
+    await tick();
+
+    assert.equal(created[0].closed, true);
+    assert.deepEqual(forceStopped, ['phone']);
+    assert.equal(delegate.liveKitShared, null);
+
+    delegate.acquireLiveKitSource();
+    assert.equal(created.length, 2);
+});
+
+test('a snapshot that gives up does not close the connection a live view is waiting on', async () => {
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
+    const created = useFakeLiveKit(delegate);
+    delegate.forwardRtp = () => {};
+
+    const lease = delegate.acquireLiveKitSource();         // as warmSnapshot does
+    await startLiveView(delegate, 'phone');
+    delegate.releaseLiveKitSource(lease);
+    delegate.releaseLiveKitSource(lease);                  // releasing twice counts once
+
+    assert.equal(created[0].closed, false);
+    assert.equal(delegate.liveKitShared.users, 1);
+
+    await delegate.handleStreamRequest({ sessionID: 'phone', type: 'stop' }, () => {});
+    assert.equal(created[0].closed, true);
+});
+
+test('a live view prepared but never started gives the connection back', () => {
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
+    const created = useFakeLiveKit(delegate);
+
+    const timers = [];
+    const realSetTimeout = global.setTimeout;
+    global.setTimeout = (fn, ms) => { timers.push({ fn, ms }); return 0; };
+    try {
+        delegate.prepareStream(liveKitStreamRequest('abandoned'), () => {});
+    } finally {
+        global.setTimeout = realSetTimeout;
+    }
+    assert.equal(created[0].closed, false);
+
+    timers.find((timer) => timer.ms === 20000).fn();       // HomeKit never sent 'start'
+    assert.equal(created[0].closed, true);
+    assert.deepEqual(delegate.pendingSessions, {});
+});
+
+test('forwarding re-stamps a copy, the packet other viewers get is unchanged', () => {
+    const { RtpHeader } = require('werift');
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
+    const header = new RtpHeader({ payloadType: 96, ssrc: 1234, sequenceNumber: 7, timestamp: 90000, marker: true, extension: true, extensions: [{ id: 1, payload: Buffer.from([1]) }] });
+    const rtp = { header, payload: Buffer.from([0x65, 1]) };
+
+    let sent;
+    delegate.forwardRtp(rtp, { encrypt: (payload, h) => { sent = h; return Buffer.alloc(1); } }, { send: () => {} }, 99, 5555, 5010, '192.168.1.5');
+
+    assert.equal(sent.payloadType, 99);
+    assert.equal(sent.ssrc, 5555);
+    assert.equal(sent.sequenceNumber, 7);
+    assert.equal(sent.marker, true);
+    assert.equal(sent.extension, false);
+    assert.equal(header.payloadType, 96);
+    assert.equal(header.ssrc, 1234);
+    assert.equal(header.extension, true);
+});
+
+test('padding stripped by werift is not claimed to HomeKit, padding-only probes are not forwarded', () => {
+    const { RtpHeader, RtpPacket } = require('werift');
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
+    const key = Buffer.alloc(30, 7);
+    const encrypt = delegate.createSrtpSession(key);
+    const decrypt = delegate.createSrtpSession(key);
+    const sent = [];
+    const socket = { send: (buf) => sent.push(buf) };
+
+    // as LiveKit sends it: 4 bytes of padding, the payload's last byte would read as a padding count
+    const padded = RtpPacket.deSerialize(new RtpPacket(new RtpHeader({ payloadType: 96, ssrc: 1, sequenceNumber: 9, padding: true, paddingSize: 4 }), Buffer.from([0x65, 1, 2, 7])).serialize());
+    assert.equal(padded.payload.length, 4);
+    delegate.forwardRtp(padded, encrypt, socket, 99, 5555, 5010, '192.168.1.5');
+
+    const received = RtpPacket.deSerialize(decrypt.decrypt(sent[0]));
+    assert.deepEqual([...received.payload], [0x65, 1, 2, 7]);
+
+    const probe = RtpPacket.deSerialize(new RtpPacket(new RtpHeader({ payloadType: 96, ssrc: 1, sequenceNumber: 10, padding: true, paddingSize: 200 }), Buffer.alloc(0)).serialize());
+    delegate.forwardRtp(probe, encrypt, socket, 99, 5555, 5010, '192.168.1.5');
+    assert.equal(sent.length, 1);
+});
+
+test('a viewer whose shared connection dropped before its start is told so, not left without video', async () => {
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
+    const created = useFakeLiveKit(delegate);
+    delegate.forwardRtp = () => {};
+    delegate.controller.forceStopStreamingSession = () => {};
+
+    await startLiveView(delegate, 'phone');
+    const source = created[0];
+    source.streaming = true;
+    source.connected();
+    await tick();
+
+    delegate.prepareStream(liveKitStreamRequest('tablet'), () => {});   // joins the running stream
+    const listeners = source.listeners('ended');
+    source.close();                                                        // the room goes away before 'start'
+    listeners.forEach((listener) => listener('signalling closed'));
+
+    const calls = [];
+    await delegate.handleStreamRequest({ sessionID: 'tablet', type: 'start', video: {}, audio: { codec: 'OPUS' } }, (...a) => calls.push(a));
+
+    assert.equal(calls.length, 1);
+    assert.ok(calls[0][0] instanceof Error);
+    assert.deepEqual(Object.keys(delegate.liveKitSessions), []);
+    assert.equal(delegate.canRefreshSnapshot(), true, 'snapshots keep refreshing');
+
+    await startLiveView(delegate, 'tablet-again');
+    assert.equal(created.length, 2, 'the next live view reconnects');
+});
+
+test('a stop for a live view that never started gives the connection back at once', async () => {
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
+    const created = useFakeLiveKit(delegate);
+
+    delegate.prepareStream(liveKitStreamRequest('dropped'), () => {});
+    await delegate.handleStreamRequest({ sessionID: 'dropped', type: 'stop' }, () => {});
+
+    assert.equal(created[0].closed, true);
+    assert.deepEqual(delegate.pendingSessions, {});
+});
+
+test('the motion test measures how soon video and a keyframe follow the event, then gives the connection back', async () => {
+    const lines = [];
+    const log = (...args) => lines.push(args.join(' '));
+    log.error = log;
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit', log, liveStatus: 'online' }));
+    const created = useFakeLiveKit(delegate);
+
+    const running = delegate.runMotionTest({ eventCid: 1170 }, Date.now());
+    await tick();
+    const source = created[0];
+    source.streaming = true;
+    source.connected();
+    await tick();
+    source.emit('keyframe', {});
+    await running;
+
+    assert.match(lines.find((line) => line.startsWith('Motion test')), /^Motion test for 'Garage Camera': video \d+\.\ds and first keyframe \d+\.\ds after the event arrived \(new connection, camera online at the event\)$/);
+    assert.ok(lines.includes("Clip test for 'Garage Camera': the event names no SimpliSafe clip"));
+    assert.equal(source.closed, true);
+
+    await delegate.runMotionTest({ eventCid: 1170 }, Date.now());
+    assert.equal(created.length, 1, 'at most one test a minute per camera');
+});
+
+test('a clip link that is not on simplisafe.com is never fetched and never logged', async () => {
+    const lines = [];
+    const log = (...args) => lines.push(args.join(' '));
+    log.error = log;
+    const delegate = new StreamingDelegate(createCameraStub({ log }));
+
+    const event = { videoStartedBy: 'cam', video: { cam: { preroll: 5, _links: { 'playback/flv': { href: 'https://evil.example/7654321/clip.flv' }, 'snapshot/jpg': { href: 'http://media.simplisafe.com/7654321/x.jpg' } } } } };
+    await delegate.runMotionTest(event, Date.now());
+
+    assert.deepEqual(lines, ["Clip test for 'Garage Camera': no playback link on simplisafe.com (links playback/flv|snapshot/jpg)"]);
+});
+
+test('audio timing compares the camera\'s Opus packets with what HomeKit asked for', () => {
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
+    const packets = Array.from({ length: 10 }, (_, i) => ({ header: { timestamp: (4294966000 + i * 960) >>> 0 }, payload: Buffer.from([0xfc, 0]) }));
+
+    assert.equal(delegate.describeAudioTiming(packets, { sample_rate: 24, packet_time: 20 }),
+        'camera sends 20 ms Opus packets, timestamps 960 apart (48 kHz clock); HomeKit asked for 24 kHz in 20 ms packets, re-cut to match');
+});
+
+test('the clip test stops retrying once SimpliSafe rate limits the plugin', async () => {
+    const lines = [];
+    const log = (...args) => lines.push(args.join(' '));
+    log.error = log;
+    const delegate = new StreamingDelegate(createCameraStub({ log }));
+    delegate.simplisafe.isBlocked = true;
+    delegate.simplisafe.nextAttempt = Date.now() + 60000;
+
+    const event = { videoStartedBy: 'cam', video: { cam: { preroll: 5, _links: { 'playback/flv': { href: 'https://chronicle.simplisafe.com/clip.flv' } } } } };
+    await delegate.probeEventClip(event, Date.now());
+
+    assert.deepEqual(lines, ["Clip test for 'Garage Camera': stopped after 0 attempt(s), SimpliSafe is rate limiting the plugin"]);
+});
+
+test('a Doorbell Pro or SimpliCam recording asks nothing of SimpliSafe while it rate limits the plugin', async () => {
+    const https = require('node:https');
+    const get = https.get;
+    const requests = [];
+    https.get = (options, callback) => {
+        requests.push(options.host);
+        const req = new EventEmitter();
+        req.destroy = () => {};
+        setImmediate(() => callback(Object.assign(new EventEmitter(), { statusCode: 403, resume() {} })));
+        return req;
+    };
+    try {
+        const delegate = new StreamingDelegate(createCameraStub({
+            simplisafe: { isBlocked: true, nextAttempt: Date.now() + 60000 },
+        }));
+        const source = delegate.createRecordingSource({ audio: true });
+        // ends once the recording delegate listens, so an always connected camera tries again later
+        assert.equal(source.ended, false);
+        const reason = await new Promise((resolve) => source.once('end', resolve));
+        assert.equal(reason, 'request blocked (rate limited)');
+        assert.deepEqual(requests, []);
+    } finally {
+        https.get = get;
+    }
+});
+
+test('a live view re-cuts the camera\'s 100 ms Opus packets into the 20 ms packets HomeKit plays', async () => {
+    const { opusPacket, opusFrames } = require('../dist/lib/opus');
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
+    const created = useFakeLiveKit(delegate);
+    const sent = [];
+    delegate.forwardRtp = (rtp, srtp, socket, payloadType) => sent.push({ payloadType, header: rtp.header, payload: rtp.payload });
+
+    delegate.prepareStream(liveKitStreamRequest('phone'), () => {});
+    await delegate.handleStreamRequest({
+        sessionID: 'phone', type: 'start',
+        video: { width: 1280, height: 720, fps: 30, max_bit_rate: 299 },
+        audio: { codec: 'OPUS', sample_rate: 24, packet_time: 20 },
+    }, () => {});
+    const source = created[0];
+    source.streaming = true;
+    source.connected();
+    await tick();
+
+    const frame = Buffer.from([0xaa, 0xbb]);
+    source.emit('audio', { header: { timestamp: 96000, sequenceNumber: 7, ssrc: 1, payloadType: 111 }, payload: opusPacket(0xf8, [frame, frame, frame, frame, frame]) });
+    source.emit('audio', { header: { timestamp: 100800, sequenceNumber: 8, ssrc: 1, payloadType: 111 }, payload: opusPacket(0xf8, [frame, frame, frame, frame, frame]) });
+
+    const audio = sent.filter((packet) => packet.payloadType === 110);
+    assert.equal(audio.length, 10);
+    assert.deepEqual(audio.map((packet) => packet.header.timestamp), [0, 480, 960, 1440, 1920, 2400, 2880, 3360, 3840, 4320]);
+    for (const packet of audio) assert.deepEqual(opusFrames(packet.payload).frames, [frame]);
+    await delegate.handleStreamRequest({ sessionID: 'phone', type: 'stop' }, () => {});
+});
+
+// A minimal JPEG of the given size: start, frame header, end
+function jpegOf(width, height) {
+    const sof = Buffer.from([0xFF, 0xC0, 0, 17, 8, height >> 8, height & 0xff, width >> 8, width & 0xff, 3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1]);
+    return Buffer.concat([Buffer.from([0xFF, 0xD8]), sof, Buffer.from([0xFF, 0xD9])]);
+}
+
+function kvsEvent(href = 'https://chronicle.us-east-1.prd.cam.simplisafe.com/v1/x/snapshot?t=1{&width}') {
+    return { videoStartedBy: 'cam', video: { cam: { recordingType: 'KVS', preroll: 12, _links: { 'snapshot/jpg': { href } } } } };
+}
+
+test('a motion notification uses SimpliSafe\'s image of the event rather than waking the camera', async () => {
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
+    let woke = 0;
+    delegate.warmSnapshot = async () => { woke++; return Buffer.from('camera'); };
+    const requested = [];
+    delegate.httpGet = async (url, options) => { requested.push({ url, token: options.token }); return { status: 200, body: jpegOf(1280, 720), host: 'chronicle.us-east-1.prd.cam.simplisafe.com' }; };
+
+    delegate.noteEvent(kvsEvent(), Date.now());
+    const image = await delegate.fetchSnapshot(true);
+
+    assert.equal(woke, 0);
+    assert.ok(image.equals(jpegOf(1280, 720)));
+    assert.deepEqual(requested, [{ url: 'https://chronicle.us-east-1.prd.cam.simplisafe.com/v1/x/snapshot?t=1&width=1280', token: 'token-123' }]);
+
+    assert.equal((await delegate.fetchSnapshot(true)).toString(), 'camera', 'an event\'s image is used once, later refreshes ask the camera');
+});
+
+test('a small, late or missing event image falls back to the camera', async () => {
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
+    delegate.warmSnapshot = async () => Buffer.from('camera');
+
+    delegate.httpGet = async () => ({ status: 200, body: jpegOf(320, 180) });
+    delegate.noteEvent(kvsEvent(), Date.now());
+    assert.equal((await delegate.fetchSnapshot(true)).toString(), 'camera', 'too small');
+
+    let calls = 0;
+    delegate.warmSnapshot = () => new Promise((resolve) => setTimeout(() => resolve(Buffer.from('camera')), 2000)); // a camera waking up
+    delegate.httpGet = async () => { calls++; return calls < 3 ? { status: 404 } : { status: 200, body: jpegOf(1280, 720) }; };
+    delegate.noteEvent(kvsEvent(), Date.now());
+    assert.ok((await delegate.fetchSnapshot(true)).equals(jpegOf(1280, 720)), 'ready on the third try, inside the wait');
+    delegate.warmSnapshot = async () => Buffer.from('camera');
+
+    delegate.httpGet = async () => ({ status: 403 });
+    delegate.noteEvent(kvsEvent(), Date.now());
+    assert.equal((await delegate.fetchSnapshot(true)).toString(), 'camera', 'refused');
+
+    delegate.httpGet = async () => assert.fail('an old event is not fetched');
+    delegate.noteEvent(kvsEvent(), Date.now() - 20000);
+    assert.equal((await delegate.fetchSnapshot(true)).toString(), 'camera');
+});
+
+test('only KVS clips on simplisafe.com are used, the Doorbell Pro\'s took 25s or more', async () => {
+    const delegate = new StreamingDelegate(createCameraStub());
+    delegate.fetchLegacySnapshot = async () => Buffer.from('mjpeg');
+    delegate.httpGet = async () => assert.fail('not fetched');
+
+    delegate.noteEvent({ videoStartedBy: 'cam', video: { cam: { recordingType: 'TEP', _links: { 'snapshot/jpg': { href: 'https://media.simplisafe.com/x' } } } } }, Date.now());
+    assert.equal(delegate.eventImage, null);
+    delegate.noteEvent(kvsEvent('https://evil.example/snapshot'), Date.now());
+    assert.equal(delegate.eventImage, null);
+    assert.equal((await delegate.fetchSnapshot(false)).toString(), 'mjpeg');
+});
+
+test('eventImages false keeps asking the camera', async () => {
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit', cameraOptions: { eventImages: false } }));
+    delegate.noteEvent(kvsEvent(), Date.now());
+    assert.equal(delegate.eventImage, null);
+});
+
+test('a slow event image gets a head start, then the camera is asked too and the first image wins', async () => {
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
+    let woke = 0;
+    delegate.warmSnapshot = () => { woke++; return new Promise((resolve) => setTimeout(() => resolve(Buffer.from('camera')), 300)); };
+
+    // the image is ready after 2s: past the head start, but before the camera
+    let calls = 0;
+    delegate.httpGet = async () => (++calls < 5 ? { status: 404 } : { status: 200, body: jpegOf(1280, 720) });
+    delegate.noteEvent(kvsEvent(), Date.now());
+    const started = Date.now();
+    const image = await delegate.fetchSnapshot(true);
+    assert.equal(woke, 1, 'the camera was asked after the head start');
+    assert.equal(image.toString(), 'camera', 'and its image came first');
+    assert.ok(Date.now() - started < 2200);
+
+    // an event image that arrives before the camera's wins
+    delegate.warmSnapshot = () => { woke++; return new Promise((resolve) => setTimeout(() => resolve(Buffer.from('camera')), 3000)); };
+    calls = 0;
+    delegate.httpGet = async () => (++calls < 4 ? { status: 404 } : { status: 200, body: jpegOf(1280, 720) });
+    delegate.noteEvent(kvsEvent(), Date.now());
+    assert.ok((await delegate.fetchSnapshot(true)).equals(jpegOf(1280, 720)));
+});
+
+test('a server error for the event image asks the camera at once, and the head start counts from the event', async () => {
+    const delegate = new StreamingDelegate(createCameraStub({ getStreamProvider: () => 'livekit' }));
+    let askedAt = null;
+    delegate.warmSnapshot = async () => { askedAt = Date.now(); return Buffer.from('camera'); };
+
+    delegate.httpGet = async () => ({ status: 503 });
+    delegate.noteEvent(kvsEvent(), Date.now());
+    let started = Date.now();
+    assert.equal((await delegate.fetchSnapshot(true)).toString(), 'camera');
+    assert.ok(askedAt - started < 200, 'no head start once the still is failing');
+
+    // HomeKit asked 900 ms after the event: the camera is asked about 100 ms later, not a full head start later
+    delegate.httpGet = async () => ({ status: 404 });
+    delegate.noteEvent(kvsEvent(), Date.now() - 900);
+    started = Date.now();
+    await delegate.fetchSnapshot(true);
+    assert.ok(askedAt - started < 400, `camera asked ${askedAt - started} ms after the request`);
+});
+
+test('a later event without a still of its own does not get an earlier event\'s still', async () => {
+    const camera = createCameraStub({ getStreamProvider: () => 'livekit' });
+    const delegate = new StreamingDelegate(camera);
+    delegate.warmSnapshot = async () => Buffer.from('camera');
+    delegate.httpGet = async () => ({ status: 200, body: jpegOf(1280, 720) });
+
+    delegate.noteEvent(kvsEvent(), Date.now() - 8000);   // event A, its still never fetched
+    camera.lastEventAt = Date.now();                       // event B, a motion with no clip
+    assert.equal((await delegate.fetchSnapshot(true)).toString(), 'camera');
 });

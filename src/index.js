@@ -1,27 +1,40 @@
-import SimpliSafe3, { SENSOR_TYPES, RateLimitError } from './simplisafe';
+import path from 'path';
+import SimpliSafe3, { SYSTEM_UPDATED, RateLimitError } from './simplisafe';
 import SimpliSafe3AuthenticationManager from './lib/authManager';
-import Alarm from './accessories/alarm';
-import EntrySensor from './accessories/entrySensor';
-import MotionSensor from './accessories/motionSensor';
-import SmokeDetector from './accessories/smokeDetector';
-import CODetector from './accessories/coDetector';
-import WaterSensor from './accessories/waterSensor';
-import FreezeSensor from './accessories/freezeSensor';
-import DoorLock from './accessories/doorLock';
+import DiagnosticLog, { diagnosticsFilename } from './lib/diagnosticLog';
+import { cameraCapabilities } from './lib/diagnosticLines';
 import Camera from './accessories/camera';
 import UnreachableAccessory from './accessories/unreachableAccessory';
 
-const PLUGIN_NAME = 'homebridge-simplisafe3';
-const PLATFORM_NAME = 'SimpliSafe 3';
+// Named apart from homebridge-simplisafe3 so both can be installed and run side by side. This plugin only
+// has the cameras, the alarm, sensors and locks stay with the original
+const PLUGIN_NAME = 'homebridge-simplisafe3-edited';
+const PLATFORM_NAME = 'SimpliSafe 3 Edited';
+
+const cameraRefreshInterval = 10 * 60 * 1000; // ms, keeps camera battery and charging state current
+
+let PLUGIN_VERSION = 'unknown';
+try {
+    PLUGIN_VERSION = require('./package.json').version; // package.json sits next to index.js once built
+} catch (err) { /* running from source */ }
 
 let UUIDGen;
+
+// How camera names in cameraOptions.record and alwaysConnected are compared with SimpliSafe's: case, spacing
+// and Unicode forms (e.g. a no-break space typed on a phone) do not matter
+const nameKey = name => String(name).normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase();
+// A list of camera names from the config: a list, or a comma-separated string written into config.json by hand
+const nameList = value => (Array.isArray(value) ? value : typeof value === 'string' ? value.split(',') : [])
+    .filter(name => typeof name === 'string' || typeof name === 'number')
+    .map(name => String(name).trim())
+    .filter(name => name);
 
 class SS3Platform {
 
     constructor(log, config, api) {
+        log = this.keepLogsForClaude(log, config, api);
         this.log = log;
         this.name = config.name;
-        this.enableCameras = config.cameras || false;
         this.cameraOptions = config.cameraOptions || null;
         this.debug = config.debug || false;
         this.persistAccessories = config.persistAccessories !== undefined ? config.persistAccessories : true;
@@ -32,14 +45,22 @@ class SS3Platform {
 
         this.cachedAccessoryConfig = [];
         this.unreachableAccessories = [];
+        this.discovered = false; // whether SimpliSafe has listed the cameras, nothing is removed before that
 
-        let refreshInterval = 15000;
-        if (config.sensorRefresh) {
-            refreshInterval = config.sensorRefresh * 1000;
+        // easily put next to cameraOptions instead of inside it, where they would be ignored without a word
+        for (const key of ['record', 'alwaysConnected']) {
+            if (config[key] !== undefined && !(config.cameraOptions && config.cameraOptions[key] !== undefined)) {
+                this.log.warn(`'${key}' has to be inside 'cameraOptions' in the config, like "cameraOptions": { "${key}": ["Front Door"] }. As it is, no camera is ${key === 'record' ? 'recorded' : 'kept connected'}.`);
+            }
         }
 
+        if (config.camerasOnly === false) {
+            this.log.warn('This plugin only adds cameras, Cameras Only is no longer a setting. The alarm, sensors and locks are for homebridge-simplisafe3.');
+        }
+
+        this.snapshotDir = path.join(this.api.user.storagePath(), `${PLUGIN_NAME}-snapshots`);
         this.authManager = new SimpliSafe3AuthenticationManager(this.api.user.storagePath(), log, this.debug);
-        this.simplisafe = new SimpliSafe3(refreshInterval, this.authManager, this.api.user.storagePath(), log, this.debug);
+        this.simplisafe = new SimpliSafe3(this.authManager, this.api.user.storagePath(), log, this.debug);
 
         if (config.subscriptionId) {
             if (this.debug) this.log(`Specifying account number: ${config.subscriptionId}`);
@@ -78,8 +99,9 @@ class SS3Platform {
                 .then(() => {
                     if (!this.authManager.isAuthenticated()) throw new Error('Not authenticated with SimpliSafe.');
                     else {
-                        this.simplisafe.startListening();
+                        this.simplisafe.startListening().catch(err => this.log.error('SimpliSafe real time events could not start:', err));
                         this.createNewPlatformAccessories();
+                        this.startCameraRefresh();
                     }
                 })
                 .catch(err => {
@@ -102,26 +124,17 @@ class SS3Platform {
                     let device = this.devices.find(device => device.uuid === accessory.UUID);
 
                     if (device) {
-                        if (this.debug) this.log(`Initializing device ${device.constructor.name} '${device.name ? device.name : device.uuid}' with cached accessory`);
+                        if (this.debug) this.log(`Initializing camera '${device.name ? device.name : device.uuid}' with cached accessory`);
                         device.setAccessory(accessory);
                         this.accessories.push(accessory);
                     } else {
-                        if (this.debug) this.log(`Cached accessory {${accessory.UUID}} not matched to a SimpliSafe device`);
-                        if (!this.authManager.isAuthenticated() && accessory.services.find(s => s.UUID == this.api.hap.Service.SecuritySystem.UUID) &&
-                            accessory._associatedPlugin == PLUGIN_NAME) {
-                            // In the case of initial auth failure instantiate the cached alarm and set fault
-                            const alarmAccessory = new Alarm(
-                                'SimpliSafe 3',
-                                '000',
-                                this.log,
-                                this.debug,
-                                this.simplisafe,
-                                this.api
-                            );
-                            
-                            this.devices.push(alarmAccessory);
-                            alarmAccessory.setAccessory(accessory);
-                            alarmAccessory.setFault();
+                        if (this.debug) this.log(`Cached accessory {${accessory.UUID}} not matched to a SimpliSafe camera`);
+                        if (!accessory.services.find(s => s.UUID == this.api.hap.Service.CameraRTPStreamManagement.UUID)) {
+                            // an alarm, sensor or lock from before this plugin was camera-only can never be updated
+                            // again: kept, it would answer HomeKit with its last state, and on a shared bridge it would
+                            // stop homebridge-simplisafe3 adding its own (same UUID)
+                            this.log.warn(`Removing '${accessory.displayName}' from HomeKit, this plugin only has cameras. The alarm, sensors and locks are for homebridge-simplisafe3.`);
+                            this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
                         } else {
                             this.removeAccessory(accessory);
                         }
@@ -139,7 +152,8 @@ class SS3Platform {
 
     removeAccessory(accessory) {
         if (accessory) {
-            if (!this.persistAccessories && !this.simplisafe.isBlocked) {
+            // a failed login or discovery lists no cameras, that does not mean they are gone
+            if (!this.persistAccessories && !this.simplisafe.isBlocked && this.discovered) {
                 if (this.debug) this.log('Removing accessory', accessory.name ?? accessory.UUID);
                 this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
             }
@@ -153,231 +167,149 @@ class SS3Platform {
         for (let device of this.devices) {
             let existingAccessory = this.accessories.find(acc => acc.UUID == device.uuid);
             if (!existingAccessory) {
-                if (this.debug) this.log(`Initializing SS device '${device.name}' with new accessory.`);
+                if (this.debug) this.log(`Initializing camera '${device.name}' with new accessory.`);
                 let accessory = device.createAccessory(); // from SimpliSafe3Accessory
+                // a camera is the same accessory in homebridge-simplisafe3, and one bridge can only have it once
+                const alreadyOnBridge = `Could not add '${device.name}': this bridge already has it, probably from homebridge-simplisafe3. Run this plugin as a child bridge (Bridge Settings), or turn off cameras in homebridge-simplisafe3 and remove its camera accessories (Settings, Remove Single Cached Accessory).`;
                 try {
                     this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+                    // Homebridge 2 skips an accessory whose UUID the bridge already has, with only a warning
+                    if (accessory._associatedHAPAccessory && accessory._associatedHAPAccessory.bridged === false) {
+                        this.log.error(alreadyOnBridge);
+                        continue;
+                    }
                     this.accessories.push(accessory);
                 } catch (err) {
-                    this.log.error('An error occurred while adding accessory:', err.toJSON ? err.toJSON() : err);
+                    if (/same UUID/i.test(String(err && err.message))) {
+                        this.log.error(alreadyOnBridge);
+                    } else {
+                        this.log.error('An error occurred while adding accessory:', err.toJSON ? err.toJSON() : err);
+                    }
                 }
             }
         }
     }
 
+    // Keeps this plugin's recent log lines, without secrets, for the settings page's 'Logs for Claude' card
+    keepLogsForClaude(log, config, api) {
+        if (config.logsForClaude === false) return log;
+
+        this.diagnosticLog = new DiagnosticLog({
+            file: path.join(api.user.storagePath(), diagnosticsFilename),
+            version: PLUGIN_VERSION,
+            summary: () => this.cameraSummary()
+        });
+        api.on('shutdown', () => this.diagnosticLog.flush(true));
+        return this.diagnosticLog.wrap(log);
+    }
+
+    cameraSummary() {
+        return (this.devices || []).map(camera => camera.diagnostics()).join('\n');
+    }
+
+    // Camera details, e.g. battery level, are only fetched with the alarm system, so pass on every update
+    // and ask for one now and then in case nothing else does
+    startCameraRefresh() {
+        if (this.cameraRefreshIntervalID) return;
+
+        this.simplisafe.on(SYSTEM_UPDATED, system => {
+            try {
+                this.updateCameraDetails(system.cameras);
+            } catch (err) {
+                this.log.error('An error occurred while updating camera details:', err);
+            }
+        });
+
+        this.cameraRefreshIntervalID = setInterval(() => {
+            this.simplisafe.getCameras().catch(err => {
+                if (this.debug && !(err instanceof RateLimitError)) this.log.error('Camera details refresh failed:', err.message || err);
+            });
+        }, cameraRefreshInterval);
+    }
+
+    updateCameraDetails(cameras) {
+        if (!Array.isArray(cameras)) return;
+        for (let device of this.devices) {
+            let details = cameras.find(camera => camera.uuid === device.id);
+            if (details) device.updateCameraDetails(details);
+        }
+    }
+
     async discoverSimpliSafeDevices() {
-        if (this.debug) this.log('Discovering devices from SimpliSafe');
+        if (this.debug) this.log('Discovering cameras from SimpliSafe');
         try {
-            let subscription = await this.simplisafe.getSubscription();
-            if (subscription.location.system.serial == null) throw new Error('System serial not found.');
-            let uuid = UUIDGen.generate(subscription.location.system.serial);
-            let alarm = this.accessories.find(acc => acc.UUID === uuid);
+            let cameras = await this.simplisafe.getCameras();
 
-            if (!alarm) {
-                const alarmAccessory = new Alarm(
-                    'SimpliSafe 3',
-                    subscription.location.system.serial,
-                    this.log,
-                    this.debug,
-                    this.simplisafe,
-                    this.api
-                );
+            for (let camera of cameras) {
+                let cameraName = camera.cameraSettings.cameraName || `Camera ${camera.uuid}`;
+                let uuid = UUIDGen.generate(camera.uuid);
 
-                this.devices.push(alarmAccessory);
-            }
+                if (this.debug) {
+                    this.log(`Discovered camera '${cameraName}' from SimpliSafe:`, JSON.stringify(camera));
+                    // the details above are too long for Logs for Claude, this is what matters in them
+                    this.log(`Camera '${cameraName}' ${cameraCapabilities(camera)}`);
+                }
 
-            let sensors = await this.simplisafe.getSensors();
-            for (let sensor of sensors) {
-                if (sensor.type == SENSOR_TYPES.KEYPAD ||
-                    sensor.type == SENSOR_TYPES.KEYCHAIN ||
-                    sensor.type == SENSOR_TYPES.PANIC_BUTTON ||
-                    sensor.type == SENSOR_TYPES.GLASSBREAK_SENSOR ||
-                    sensor.type == SENSOR_TYPES.SIREN ||
-                    sensor.type == SENSOR_TYPES.SIREN_2 ||
-                    sensor.type == SENSOR_TYPES.DOORLOCK ||
-                    sensor.type == SENSOR_TYPES.DOORLOCK_2) {
-                    // Ignore as no data is provided by SimpliSafe
-                    // Door locks are configured below
+                if (camera.serial && this.excludedDevices.includes(camera.serial)) {
+                    this.log.info(`Excluding camera with serial '${camera.serial}'`);
                     continue;
                 }
 
-                let uuid = UUIDGen.generate(sensor.serial);
-                let accessory = this.accessories.find(acc => acc.UUID === uuid);
-                let sensorName = sensor.name;
-                if (this.debug) {
-                    this.log(`Discovered sensor '${sensor.name}' from SimpliSafe:`, JSON.stringify(sensor));
-                }
-
-                if (sensor.serial && this.excludedDevices.includes(sensor.serial)) {
-                    this.log.info(`Excluding sensor with serial '${sensor.serial}'`);
-                    continue;
-                }
-
-                if (sensor.type == SENSOR_TYPES.ENTRY_SENSOR) {
-                    if (!accessory) {
-                        sensorName = sensorName || `Entry Sensor ${sensor.serial}`;
-                        const sensorAccessory = new EntrySensor(
-                            sensorName,
-                            sensor.serial,
-                            this.log,
-                            this.debug,
-                            this.simplisafe,
-                            this.api
-                        );
-
-                        this.devices.push(sensorAccessory);
-                    }
-                } else if (sensor.type == SENSOR_TYPES.CO_SENSOR) {
-                    if (!accessory) {
-                        sensorName = sensorName || `CO Detector ${sensor.serial}`;
-                        const sensorAccessory = new CODetector(
-                            sensorName,
-                            sensor.serial,
-                            this.log,
-                            this.debug,
-                            this.simplisafe,
-                            this.api
-                        );
-
-                        this.devices.push(sensorAccessory);
-                    }
-                } else if (sensor.type == SENSOR_TYPES.SMOKE_SENSOR) {
-                    if (!accessory) {
-                        sensorName = sensorName || `Smoke Detector ${sensor.serial}`;
-                        const sensorAccessory = new SmokeDetector(
-                            sensorName,
-                            sensor.serial,
-                            this.log,
-                            this.debug,
-                            this.simplisafe,
-                            this.api
-                        );
-
-                        this.devices.push(sensorAccessory);
-                    }
-                } else if (sensor.type == SENSOR_TYPES.WATER_SENSOR) {
-                    if (!accessory) {
-                        sensorName = sensorName || `Water Sensor ${sensor.serial}`;
-                        const sensorAccessory = new WaterSensor(
-                            sensorName,
-                            sensor.serial,
-                            this.log,
-                            this.debug,
-                            this.simplisafe,
-                            this.api
-                        );
-
-                        this.devices.push(sensorAccessory);
-                    }
-                } else if (sensor.type == SENSOR_TYPES.FREEZE_SENSOR) {
-                    if (!accessory) {
-                        sensorName = sensorName || `Freeze Sensor ${sensor.serial}`;
-                        const sensorAccessory = new FreezeSensor(
-                            sensorName,
-                            sensor.serial,
-                            this.log,
-                            this.debug,
-                            this.simplisafe,
-                            this.api
-                        );
-
-                        this.devices.push(sensorAccessory);
-                    }
-                } else if (sensor.type == SENSOR_TYPES.MOTION_SENSOR) {
-                    sensorName = sensorName || `Motion Sensor ${sensor.serial}`;
-                    // Check if secret alerts are enabled
-                    if (sensor.setting.off == 0 || sensor.setting.home == 0 || sensor.setting.away == 0) {
-                        this.log.warn(`Motion Sensor '${sensorName}' requires secret alerts to be enabled in SimpliSafe before you can add it to Homebridge.`);
-                        continue;
-                    }
-                    if (!accessory) {
-                        const sensorAccessory = new MotionSensor(
-                            sensorName,
-                            sensor.serial,
-                            this.log,
-                            this.debug,
-                            this.simplisafe,
-                            this.api
-                        );
-
-                        this.devices.push(sensorAccessory);
-                    }
-                } else {
-                    this.log.warn(`Sensor not (yet) supported: ${sensor.name}`);
-                    this.log.warn(sensor);
-                }
-            }
-
-            let locks = await this.simplisafe.getLocks();
-            for (let lock of locks) {
-                let lockName = lock.name || `Smart Lock ${lock.serial}`;
-                let uuid = UUIDGen.generate(lock.serial);
-
-                if (this.debug) {
-                    this.log(`Discovered door lock '${lockName}' from SimpliSafe:`, JSON.stringify(lock));
-                }
-
-                let accessory = this.accessories.find(acc => acc.UUID === uuid);
-                if (!accessory) {
-                    const lockAccessory = new DoorLock(
-                        lockName,
-                        lock.serial,
+                let cameraAccessory = this.accessories.find(acc => acc.UUID === uuid);
+                if (!cameraAccessory) {
+                    const cameraAccessory = new Camera(
+                        cameraName,
+                        camera.uuid,
+                        camera,
+                        this.cameraOptions,
                         this.log,
                         this.debug,
                         this.simplisafe,
-                        this.api
+                        this.authManager,
+                        this.api,
+                        { snapshotDir: this.snapshotDir, recording: this.recordingFor(cameraName) }
                     );
+                    if (cameraAccessory.isUnsupported()) this.log.warn(`Detected unsupported camera ${cameraName}, some features will be disabled.`);
 
-                    this.devices.push(lockAccessory);
-                }
-
-            }
-
-            if (this.enableCameras) {
-                let cameras = await this.simplisafe.getCameras();
-
-                for (let camera of cameras) {
-                    let cameraName = camera.cameraSettings.cameraName || `Camera ${camera.uuid}`;
-                    let uuid = UUIDGen.generate(camera.uuid);
-
-                    if (this.debug) {
-                        this.log(`Discovered camera '${cameraName}' from SimpliSafe:`, JSON.stringify(camera));
-                    }
-
-                    if (camera.serial && this.excludedDevices.includes(camera.serial)) {
-                        this.log.info(`Excluding camera with serial '${camera.serial}'`);
-                        continue;
-                    }
-
-                    let cameraAccessory = this.accessories.find(acc => acc.UUID === uuid);
-                    if (!cameraAccessory) {
-                        const cameraAccessory = new Camera(
-                            cameraName,
-                            camera.uuid,
-                            camera,
-                            this.cameraOptions,
-                            this.log,
-                            this.debug,
-                            this.simplisafe,
-                            this.authManager,
-                            this.api
-                        );
-                        if (cameraAccessory.isUnsupported()) this.log.warn(`Detected unsupported camera ${cameraName}, some features will be disabled.`);
-
-                        this.devices.push(cameraAccessory);
-                    }
+                    this.devices.push(cameraAccessory);
                 }
             }
+            this.checkRecordingNames(cameras.map(camera => camera.cameraSettings.cameraName || `Camera ${camera.uuid}`));
+            this.discovered = true;
         } catch (err) {
             if (err instanceof RateLimitError) {
-                this.log.error('Accessory refresh failed due to rate limiting or connectivity:', err.toJSON ? err.toJSON() : err);
+                this.log.error('Camera discovery failed due to rate limiting or connectivity:', err.toJSON ? err.toJSON() : err);
                 this.log.info('Note: this error can also occur if you are not signed up for a SimpliSafe monitoring plan.');
             } else {
-                this.log.error('An error occurred while refreshing accessories:', err.toJSON ? err.toJSON() : err);
+                this.log.error('An error occurred while discovering cameras:', err.toJSON ? err.toJSON() : err);
             }
             throw err;
         }
 
+    }
+
+    // HomeKit Secure Video is switched on per camera, by name, in cameraOptions.record and alwaysConnected
+    recordingFor(cameraName) {
+        const options = this.cameraOptions || {};
+        const listed = list => nameList(list).some(name => nameKey(name) === nameKey(cameraName));
+        const enabled = listed(options.record);
+        return { enabled, alwaysConnected: enabled && listed(options.alwaysConnected) };
+    }
+
+    // A name in record or alwaysConnected that is not one of SimpliSafe's camera names (a typo, or the name given
+    // in the Home app) would leave that camera without recording and nothing in the log to say why
+    checkRecordingNames(cameraNames) {
+        const options = this.cameraOptions || {};
+        const known = new Set(cameraNames.map(nameKey));
+        const names = cameraNames.map(name => `'${name}'`).join(', ');
+        const recorded = new Set(nameList(options.record).map(nameKey));
+        for (const name of nameList(options.record)) {
+            if (!known.has(nameKey(name))) this.log.warn(`'${name}' in Record in HomeKit (cameraOptions.record) is not the name of a SimpliSafe camera, so nothing is recorded for it. Use the names from the SimpliSafe app: ${names}`);
+        }
+        for (const name of nameList(options.alwaysConnected)) {
+            if (!known.has(nameKey(name))) this.log.warn(`'${name}' in Always Connected (cameraOptions.alwaysConnected) is not the name of a SimpliSafe camera. Use the names from the SimpliSafe app: ${names}`);
+            else if (!recorded.has(nameKey(name))) this.log.warn(`'${name}' is in Always Connected but not in Record in HomeKit, so it is not kept connected. Add it to Record in HomeKit as well.`);
+        }
     }
 
     updateAccessoriesReachability() {

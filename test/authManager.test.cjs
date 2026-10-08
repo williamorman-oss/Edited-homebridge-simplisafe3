@@ -98,3 +98,28 @@ test('refreshCredentials clears tokens and emits failure on 4xx auth errors', as
     assert.equal(manager.accessToken, null);
     assert.equal(emitted, true);
 });
+
+test('uses its own login file so it can run next to homebridge-simplisafe3', async () => {
+    const { SimpliSafe3AuthenticationManager } = loadAuthManager({
+        postImpl: async () => ({ data: { access_token: 'new-access', refresh_token: 'new-refresh', expires_in: 3600, token_type: 'Bearer' } }),
+    });
+    const dir = createTempStorage();
+
+    try {
+        // the original plugin's login must be neither read nor touched
+        const original = JSON.stringify({ accessToken: 'a', refreshToken: 'b', codeVerifier: 'c' });
+        fs.writeFileSync(path.join(dir, 'simplisafe3auth.json'), original);
+
+        const manager = new SimpliSafe3AuthenticationManager(dir);
+        assert.equal(manager.accountsFileExists(), false);
+        assert.equal(manager.refreshToken, undefined);
+
+        await manager.getToken('code');
+        clearInterval(manager.refreshInterval);
+
+        assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'simplisafe3auth-edited.json'))).refreshToken, 'new-refresh');
+        assert.equal(fs.readFileSync(path.join(dir, 'simplisafe3auth.json')).toString(), original);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});

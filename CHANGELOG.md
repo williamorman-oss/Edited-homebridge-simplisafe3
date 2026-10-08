@@ -1,6 +1,118 @@
 # Change Log
 All notable changes are documented here.
 
+## 1.12.0-beta.9, homebridge-simplisafe3-edited (2026-10-08)
+Install, or update an earlier beta, next to the original plugin (see the README):
+```
+npm install --prefix /var/lib/homebridge https://github.com/williamorman-oss/Edited-homebridge-simplisafe3/raw/4320c8e9f9aacb3198a6056a1f1db957aba6669a/releases/homebridge-simplisafe3-edited-1.12.0-beta.9.tgz
+```
+
+- Fix: camera names could not be added to Record in HomeKit and Always Connected in the plugin's settings (no input, no Add button), so no camera recorded. Each list now has an Add Camera button. Names already in config.json are kept
+- The log warns about a name in those lists that is not a SimpliSafe camera, or one that is in Always Connected but not in Record in HomeKit, and about 'record' put next to 'cameraOptions' instead of inside it. Names match whatever their case and spacing, and a comma-separated list typed into config.json works too
+- Fix: a motion sensor that was on when Homebridge stopped came back on, so the first motion after a restart started no recording
+- If ffmpeg is missing (ffmpeg-for-homebridge could not install it), the log says so, and a Doorbell Pro or SimpliCam recording no longer takes the bridge down
+
+## 1.12.0-beta.8, homebridge-simplisafe3-edited (2026-10-08)
+Install, or update an earlier beta, next to the original plugin (see the README):
+```
+npm install --prefix /var/lib/homebridge https://github.com/williamorman-oss/Edited-homebridge-simplisafe3/raw/78ed7cb6c9412e7761e77cbf091957c4a5201024/releases/homebridge-simplisafe3-edited-1.12.0-beta.8.tgz
+```
+
+Cameras only:
+- The alarm, sensors and locks are no longer part of this plugin, along with the `cameras`, `camerasOnly` and `sensorRefresh` settings. They are for homebridge-simplisafe3, with its cameras turned off. Cameras already paired stay paired, with their recording settings and automations. The alarm state is still read, never changed, for the SimpliCam's privacy shutter
+- An alarm, sensor or lock this plugin added before is removed from HomeKit, so it no longer shows a stale state and homebridge-simplisafe3 can add its own
+- If a camera cannot be added because homebridge-simplisafe3 already has it on the same bridge, the log says so and how to fix it
+
+HomeKit Secure Video, after a full review (still opt-in with `record`):
+- Fix: Outdoor Camera recordings were corrupted until the next keyframe whenever a video packet arrived late or twice
+- Fix: an Outdoor Camera that sends no audio (e.g. its microphone is off) never recorded while 'Record Audio' was on; it now records without sound
+- 'Record Audio' and turning a camera off in the Home app are followed, also while connected; audio stops at once when turned off
+- A camera whose video stops without SimpliSafe ending the connection is reconnected after 10 seconds, so recordings, live views and snapshots do not wait on it
+- An always connected camera that reports it is on battery is only woken on motion until it charges again; the one-minute limit for recordings on battery follows the current charging state
+- Reconnects of an always connected camera that keeps dropping slow down to one every 5 minutes, to stay clear of SimpliSafe's rate limit
+- SimpliCam: never kept connected, not started by a motion event while its privacy shutter is closed, and a recording stops when an alarm change closes the shutter. Snapshots trust a motion event for 5 seconds only
+- A doorbell press counts as motion, and motion is held 20 seconds, only while HomeKit is recording
+- Doorbell Pro and SimpliCam recordings ask nothing of SimpliSafe while it rate limits the plugin
+- Fixes for Homebridge 1.x (a closed recording kept running), for re-pairing the bridge without a restart, and for the motion sensor after recording is removed
+
+Other fixes:
+- A rate limit or SimpliSafe error at startup no longer crashes the bridge
+- With `persistAccessories` off, cameras are no longer removed when the login fails at startup
+- Logs for Claude: the account numbers listed in the 'Multiple accounts found' error are removed
+
+## 1.12.0-beta.7, homebridge-simplisafe3-edited (2026-10-07)
+Install, or update an earlier beta, next to the original plugin (see the README):
+```
+npm install --prefix /var/lib/homebridge https://github.com/williamorman-oss/Edited-homebridge-simplisafe3/raw/bb20590469000fb6b87e82384cecb4ffc4ad2fd9/releases/homebridge-simplisafe3-edited-1.12.0-beta.7.tgz
+```
+
+- Fix: Outdoor Camera live view had no sound. The cameras send 100 ms Opus packets timed at 48 kHz, HomeKit only plays packets of the length and rate it asked for. Audio is now re-cut to match, without re-encoding, and only the camera's own audio is passed on (not someone talking from the SimpliSafe app)
+- Outdoor Camera motion and doorbell notifications show SimpliSafe's own image of the event when it is ready within a few seconds (usually under one), instead of waking the camera. `eventImages: false` turns this off
+- The motion sensor stays on until 5 seconds after the last motion event, rather than 5 seconds after the first
+- New, under review: HomeKit Secure Video recording, off unless cameras are listed in `record` (and optionally `alwaysConnected`), see the README. Best tried once the next beta confirms the review
+- Debug logs: when SimpliSafe says the camera was triggered, each camera's quality layers and the bitrate it sends
+
+## 1.12.0-beta.6, homebridge-simplisafe3-edited (2026-10-06)
+Install, or update an earlier beta, next to the original plugin (see the README):
+```
+npm install --prefix /var/lib/homebridge https://github.com/williamorman-oss/Edited-homebridge-simplisafe3/raw/2b4fac031e94a70498d66e22cd60c356932bacbe/releases/homebridge-simplisafe3-edited-1.12.0-beta.6.tgz
+```
+
+Diagnostics for HomeKit recording and two-way audio. Nothing changes in HomeKit.
+- Fix: the SimpliSafe subscription number appeared in 'LiveKit: joined room' lines in Logs for Claude. Removed, and redaction now also removes it from older log files when the card shows them
+- With Debug on, the logs give each camera's capabilities in one short line, when cameras wake and sleep, how late SimpliSafe's motion and doorbell events arrive and the clip SimpliSafe records for them, what the plugin may publish in an Outdoor Camera's room (whether talking is possible), and the Outdoor Cameras' video format, keyframe spacing and audio timing
+- New temporary `motionTest` camera option: after each motion or doorbell event it measures how soon the camera's video arrives and how soon SimpliSafe's own clip of the event can be read. It wakes battery cameras, so switch it off after the test
+- Fix: an unexpected live-view reply from SimpliSafe was written to the log in full, signed links and credentials included. Only its field names are logged now
+- Fix: account numbers that mix letters and digits were only partly removed from Logs for Claude
+- Fix: a doorbell press for a camera with no doorbell in HomeKit threw an error
+
+## 1.12.0-beta.5, homebridge-simplisafe3-edited (2026-10-06)
+Install, or update an earlier beta, next to the original plugin (see the README):
+```
+npm install --prefix /var/lib/homebridge https://github.com/williamorman-oss/Edited-homebridge-simplisafe3/raw/ec6223e403e7c161a4c686a94e67f4513b527428/releases/homebridge-simplisafe3-edited-1.12.0-beta.5.tgz
+```
+
+- Snapshots and live views of a LiveKit camera share one connection. A live view opened while a battery camera is being woken for a snapshot joins that wake-up instead of waking it again, and a second iPhone or iPad joins the first. The connection closes as soon as nothing uses it, so sharing never keeps a camera awake
+- A viewer joining a stream that is already running asks the camera for a keyframe, so the picture appears without waiting for the camera's next one
+- Fix: LiveKit video packets with padding reached HomeKit with bytes cut off the end, and LiveKit's padding-only bandwidth probes were forwarded as broken packets
+- A live view stopped before it started gives up its connection straight away
+
+## 1.12.0-beta.4, homebridge-simplisafe3-edited (2026-10-06)
+Install, or update an earlier beta, next to the original plugin (see the README):
+```
+npm install --prefix /var/lib/homebridge https://github.com/williamorman-oss/Edited-homebridge-simplisafe3/raw/86e667210ca62604f688837105e5d8b778dddcfa/releases/homebridge-simplisafe3-edited-1.12.0-beta.4.tgz
+```
+
+- Confirmed on real hardware: motion from every Outdoor Camera and the Video Doorbell Pro reaches HomeKit; live view started 0.9-2.7s after opening a plugged-in camera and 1.5-9.8s for one on battery
+- HomeKit stream encryption keys are no longer written to debug logs (stream requests and the ffmpeg command), and stream requests are logged in one line
+- Logs for Claude: the once-a-minute socket heartbeat is kept every 15 minutes, SimpliSafe's frequent cameraStatus messages are logged once, sleeping battery cameras read 'asleep or offline'
+
+## 1.12.0-beta.3, homebridge-simplisafe3-edited (2026-10-06)
+Install, or update an earlier beta, next to the original plugin (see the README):
+```
+npm install --prefix /var/lib/homebridge https://github.com/williamorman-oss/Edited-homebridge-simplisafe3/raw/1de3d4f4516e9a63561347d2576c8523d954070d/releases/homebridge-simplisafe3-edited-1.12.0-beta.3.tgz
+```
+
+- 'Logs for Claude' card in the plugin's settings: recent log lines with passwords, tokens, email addresses, MAC addresses, Wi-Fi names and account numbers removed, and a button to copy them. Nothing is sent anywhere
+- Debug logs now give live view and snapshot timings
+
+## 1.12.0-beta.2, homebridge-simplisafe3-edited (2026-10-06)
+Install next to the original plugin (see the README):
+```
+npm install --prefix /var/lib/homebridge https://github.com/williamorman-oss/Edited-homebridge-simplisafe3/raw/d8f6173c8f336d74e76a0134c8cd7cc0203a6153/releases/homebridge-simplisafe3-edited-1.12.0-beta.2.tgz
+```
+
+- Snapshots are answered straight away from the latest image and refreshed in the background. HomeKit sends a bridge's requests one at a time, so a slow or offline camera used to hold up every other camera, live view and the alarm
+- Faster live view for the SimpliCam and Video Doorbell Pro: video starts about 2 seconds sooner and no longer runs about 2 seconds behind
+- Outdoor Camera: battery level and charging state in HomeKit, less frequent snapshots while on battery (`batterySnapshotMinutes`), placeholder and back-off for cameras that do not respond, no more "Sensor not (yet) supported" warnings
+- New `camerasOnly` option to run cameras on their own bridge
+- Fix: `"-tune false"` style options now remove the argument as documented, and new `videoOptions` / `audioOptions` arguments are no longer ignored
+- SimpliCam privacy shutter: snapshots are only shown or fetched while the alarm state is known (checked at most 10 seconds earlier) and the shutter is open for it; otherwise the privacy image is shown. Its snapshots are never written to disk
+- Fix: a failed SimpliSafe request during a SimpliCam snapshot could leave HomeKit waiting and crash the bridge
+- Fix: if ffmpeg could not be started, HomeKit was answered twice, which crashed the bridge
+- Fix: LiveKit audio packets could be sent to HomeKit twice
+- The access token is no longer written to the debug log
+
 ## v1.11.2 (2026-09-27)
 - Use direct Opus encoding for Video Doorbell Series 2 audio
 

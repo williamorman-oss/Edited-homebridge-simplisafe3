@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const EventEmitter = require('node:events');
 
 const { loadSimplisafe } = require('./helpers/load-simplisafe.cjs');
+const { useFakeTimers } = require('./helpers/fake-timers.cjs');
 
 class FakeAuthManager extends EventEmitter {
     constructor({
@@ -40,7 +41,7 @@ test('request short-circuits with RateLimitError while blocked', async () => {
             throw new Error('should not be called');
         },
     });
-    const ss = new SimpliSafe3(15000, new FakeAuthManager(), '/tmp', createLogger(), false);
+    const ss = new SimpliSafe3(new FakeAuthManager(), '/tmp', createLogger(), false);
     ss.isBlocked = true;
     ss.nextAttempt = Date.now() + 1000;
 
@@ -63,7 +64,7 @@ test('request refreshes credentials and forwards Authorization header', async ()
         tokenType: 'Bearer',
         accessToken: 'refreshed-token',
     });
-    const ss = new SimpliSafe3(15000, authManager, '/tmp', createLogger(), false);
+    const ss = new SimpliSafe3(authManager, '/tmp', createLogger(), false);
 
     const result = await ss.request({ method: 'GET', url: '/foo', headers: { 'X-Test': 'yes' } });
 
@@ -80,7 +81,7 @@ test('request converts 403 responses into RateLimitError and updates block state
             throw err;
         },
     });
-    const ss = new SimpliSafe3(15000, new FakeAuthManager(), '/tmp', createLogger(), true);
+    const ss = new SimpliSafe3(new FakeAuthManager(), '/tmp', createLogger(), true);
 
     await assert.rejects(
         ss.request({ method: 'GET', url: '/foo' }),
@@ -94,7 +95,7 @@ test('getSubscriptions filters unsupported plans and respects account selection'
     const { default: SimpliSafe3 } = loadSimplisafe({
         requestImpl: async () => ({ data: {} }),
     });
-    const ss = new SimpliSafe3(15000, new FakeAuthManager(), '/tmp', createLogger(), false);
+    const ss = new SimpliSafe3(new FakeAuthManager(), '/tmp', createLogger(), false);
     ss.accountNumber = 'acct-2';
     ss.getUserId = async () => 'user-1';
     ss.request = async () => ({
@@ -110,4 +111,175 @@ test('getSubscriptions filters unsupported plans and respects account selection'
     assert.equal(subscriptions.length, 1);
     assert.equal(subscriptions[0].sid, 'keep-me');
     assert.equal(ss.subId, 'keep-me');
+});
+
+function subscriptionResponse(system) {
+    return { data: { subscription: { location: { system } } } };
+}
+
+test('getAlarmSystem records the alarm state and shares the system with listeners', async () => {
+    const { default: SimpliSafe3, SYSTEM_UPDATED } = loadSimplisafe({
+        requestImpl: async () => subscriptionResponse({ alarmState: 'HOME', cameras: [{ uuid: 'cam' }] }),
+    });
+    const ss = new SimpliSafe3(new FakeAuthManager(), '/tmp', createLogger(), false);
+    ss.subId = 123;
+    let shared;
+    ss.on(SYSTEM_UPDATED, (system) => { shared = system; });
+
+    await ss.getAlarmSystem();
+
+    assert.equal(ss.lastAlarmState, 'HOME');
+    assert.deepEqual(shared.cameras, [{ uuid: 'cam' }]);
+});
+
+test('getCurrentAlarmState uses a state seen in the last few seconds without a request', async () => {
+    let requests = 0;
+    const { default: SimpliSafe3 } = loadSimplisafe({
+        requestImpl: async () => { requests++; return subscriptionResponse({ alarmState: 'AWAY' }); },
+    });
+    const ss = new SimpliSafe3(new FakeAuthManager(), '/tmp', createLogger(), false);
+    ss.subId = 123;
+
+    ss.recordAlarmState('OFF');
+    assert.equal(await ss.getCurrentAlarmState(), 'OFF');
+    assert.equal(requests, 0);
+});
+
+test('getCurrentAlarmState asks again rather than trusting an older state', async () => {
+    let requests = 0;
+    const { default: SimpliSafe3 } = loadSimplisafe({
+        requestImpl: async () => { requests++; return subscriptionResponse({ alarmState: 'OFF' }); },
+    });
+    const ss = new SimpliSafe3(new FakeAuthManager(), '/tmp', createLogger(), false);
+    ss.subId = 123;
+    ss.recordAlarmState('AWAY', Date.now() - 60000);
+
+    assert.equal(await ss.getCurrentAlarmState(), 'OFF');
+    assert.equal(requests, 1);
+});
+
+test('getCurrentAlarmState never falls back to an older state when SimpliSafe does not answer', async () => {
+    let fail = false;
+    let hang = false;
+    const { default: SimpliSafe3 } = loadSimplisafe({
+        requestImpl: () => hang ? new Promise(() => {})
+            : fail ? Promise.reject(Object.assign(new Error('down'), { response: { status: 500, data: 'down' } }))
+                : Promise.resolve(subscriptionResponse({ alarmState: 'HOME' })),
+    });
+    const ss = new SimpliSafe3(new FakeAuthManager(), '/tmp', createLogger(), false);
+    ss.subId = 123;
+
+    assert.equal(await ss.getCurrentAlarmState(), 'HOME');
+
+    ss.lastAlarmStateAt = Date.now() - 60000;
+    ss.lastSubscriptionRequests = {};
+    fail = true;
+    assert.equal(await ss.getCurrentAlarmState(), null);
+
+    const slow = new SimpliSafe3(new FakeAuthManager(), '/tmp', createLogger(), false);
+    slow.subId = 456;
+    slow.recordAlarmState('AWAY', Date.now() - 60000);
+    hang = true;
+    assert.equal(await slow.getCurrentAlarmState(20), null);
+});
+
+test('an API reply older than a realtime event does not override it', () => {
+    const { default: SimpliSafe3, EVENT_TYPES, SENSOR_TYPES } = loadSimplisafe({ requestImpl: async () => ({ data: {} }) });
+    const ss = new SimpliSafe3(new FakeAuthManager(), '/tmp', createLogger(), false);
+
+    const requestedAt = Date.now() - 1000;
+    ss.emit(EVENT_TYPES.ALARM_DISARM, { sensorType: SENSOR_TYPES.KEYPAD });
+    ss.recordAlarmState('AWAY', requestedAt);
+
+    assert.equal(ss.lastAlarmState, 'OFF');
+});
+
+test('arming and disarming events from a keypad or the app update the known alarm state', () => {
+    const { default: SimpliSafe3, EVENT_TYPES, SENSOR_TYPES } = loadSimplisafe({ requestImpl: async () => ({ data: {} }) });
+    const ss = new SimpliSafe3(new FakeAuthManager(), '/tmp', createLogger(), false);
+
+    ss.emit(EVENT_TYPES.AWAY_ARM, { sensorType: SENSOR_TYPES.KEYPAD });
+    assert.equal(ss.lastAlarmState, 'AWAY');
+    ss.emit(EVENT_TYPES.ALARM_DISARM, { sensorType: SENSOR_TYPES.APP });
+    assert.equal(ss.lastAlarmState, 'OFF');
+    ss.emit(EVENT_TYPES.AWAY_ARM, { sensorType: '253' }); // Smart Lock PIN pad
+    assert.equal(ss.lastAlarmState, 'AWAY');
+
+    // a change from a source the state can't be read from forgets the state, so it is asked for again
+    ss.emit(EVENT_TYPES.ALARM_DISARM, { sensorType: 15 });
+    assert.equal(ss.lastAlarmState, null);
+});
+
+test('a timeout blocks requests briefly without growing the block like a rate limit', async () => {
+    const { default: SimpliSafe3, RateLimitError } = loadSimplisafe({
+        requestImpl: () => Promise.reject(Object.assign(new Error('timeout of 30000ms exceeded'), { code: 'ECONNABORTED' })),
+    });
+    const ss = new SimpliSafe3(new FakeAuthManager(), '/tmp', createLogger(), false);
+    const before = ss.nextBlockInterval;
+
+    await assert.rejects(ss.request({ method: 'GET', url: '/x' }), (err) => err instanceof RateLimitError);
+    assert.equal(ss.isBlocked, true);
+    assert.ok(ss.nextAttempt - Date.now() <= before);
+    assert.equal(ss.nextBlockInterval, before);
+});
+
+test('an unexpected live-view reply is described by its field names, never its contents', async () => {
+    const { default: SimpliSafe3 } = loadSimplisafe({
+        requestImpl: async () => ({ data: {
+            signedChannelEndpoint: 'wss://m-1a2b.kinesisvideo.us-east-1.amazonaws.com/?X-Amz-ChannelARN=arn%3Aaws%3A611485993050%3Achannel%2Fabc_7654321&X-Amz-Signature=5d67',
+            clientId: 'user-4433221',
+            iceServers: [{ urls: ['turn:x'], username: '1791320000:djE6', credential: 'TURNPASSWORD' }],
+            cameraStatus: 'online',
+        } }),
+    });
+    const ss = new SimpliSafe3(new FakeAuthManager(), '/tmp', createLogger(), false);
+    ss.subId = 7654321;
+
+    await assert.rejects(ss.getCameraLiveView('e15534806fb14446be20a948f11a9cfb'), (err) => {
+        assert.equal(err.message, 'Unexpected live-view response: fields signedChannelEndpoint,clientId,iceServers,cameraStatus, cameraStatus online');
+        return true;
+    });
+});
+
+test('startListening while rate limited resolves and schedules a socket retry', async () => {
+    const { default: SimpliSafe3 } = loadSimplisafe({
+        requestImpl: async () => {
+            throw new Error('should not be called');
+        },
+    });
+    const ss = new SimpliSafe3(new FakeAuthManager(), '/tmp', createLogger(), false);
+    ss.isBlocked = true;
+    ss.nextAttempt = Date.now() + 60000;
+    let retries = 0;
+    ss.handleSocketConnectionFailure = () => { retries++; };
+
+    await ss.startListening(); // used to reject with RateLimitError, which nothing caught
+    assert.equal(retries, 1);
+    assert.equal(ss.socket, undefined);
+});
+
+test('socket retry timer keeps retrying while the user ID cannot be fetched', async (t) => {
+    const timers = useFakeTimers();
+    t.after(() => timers.restore());
+    const { default: SimpliSafe3 } = loadSimplisafe({
+        requestImpl: async () => {
+            const err = new Error('server error');
+            err.response = { status: 500, statusText: 'Internal Server Error', data: 'Internal Server Error' };
+            throw err;
+        },
+    });
+    const ss = new SimpliSafe3(new FakeAuthManager(), '/tmp', createLogger(), false);
+    const unhandled = [];
+    const onUnhandled = err => unhandled.push(err);
+    process.on('unhandledRejection', onUnhandled);
+    t.after(() => process.off('unhandledRejection', onUnhandled));
+
+    await ss.startListening();
+    assert.equal(ss.nSocketConnectFailures, 1);
+    timers.tick(1000); // first retry runs startListening from the timer
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(ss.nSocketConnectFailures, 2);
+    assert.equal(ss.isAwaitingSocketReconnect, true);
+    assert.deepEqual(unhandled, []);
 });

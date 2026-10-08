@@ -1,5 +1,6 @@
 const { HomebridgePluginUiServer } = require('@homebridge/plugin-ui-utils');
 const { SimpliSafe3AuthenticationManager } = require('../lib/authManager');
+const { readDiagnostics } = require('../lib/diagnosticLog');
 
 // your class MUST extend the HomebridgePluginUiServer
 class UiServer extends HomebridgePluginUiServer {
@@ -16,6 +17,7 @@ class UiServer extends HomebridgePluginUiServer {
          this.onRequest('/getSSAuthURL', this.getSSAuthURL.bind(this));
          this.onRequest('/getAuthCodeFromUrl', this.getAuthCodeFromUrl.bind(this));
          this.onRequest('/getToken', this.getToken.bind(this));
+         this.onRequest('/diagnostics', this.getDiagnostics.bind(this));
 
          // this.ready() must be called to let the UI know you are ready to accept api calls
          this.ready();
@@ -54,6 +56,17 @@ class UiServer extends HomebridgePluginUiServer {
            return { success: false, error: error.toString() }
          }
          return { success: true, authCode: code }
+     }
+
+     /**
+    * Recent plugin logs without secrets, for the 'Logs for Claude' card
+    */
+     async getDiagnostics() {
+         try {
+             return { success: true, ...readDiagnostics(this.homebridgeStoragePath) };
+         } catch (error) {
+             return { success: false, error: error.message };
+         }
      }
 
      /**
